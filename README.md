@@ -28,17 +28,17 @@ Most modern malware hides behind packers (like UPX, VMProtect, or Themida) or st
 
 ## Installation
 
-Requirements: Python 3.8+ on Windows or Linux.
+Requirements: Python 3.8+ on Windows, Linux, or macOS.
+
+```bash
+pip install entropystrip
+```
+
+Or install directly from source:
 
 ```bash
 git clone https://github.com/dwexi/entropystrip.git
 cd entropystrip
-pip install -r requirements.txt
-```
-
-To install as a system CLI command:
-
-```bash
 pip install -e .
 ```
 

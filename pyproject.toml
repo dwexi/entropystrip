@@ -4,25 +4,45 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entropystrip"
-version = "2.0.0"
+version = "1.0.0"
 authors = [
-  { name = "EntropyStrip Security Research Team" }
+  { name = "dwexi", email = "dwexi@users.noreply.github.com" }
 ]
-description = "Algorithmic PE De-obfuscator, Shannon Entropy Scanner, and Incident Triage Engine"
+description = "Algorithmic PE de-obfuscator, Shannon entropy radar, and incident triage engine."
 readme = "README.md"
 requires-python = ">=3.8"
+keywords = ["malware-analysis", "reverse-engineering", "pe", "entropy", "shannon-entropy", "incident-response", "security", "dfir"]
+license = "MIT"
 dependencies = [
   "pefile>=2024.8.26",
   "rich>=13.7.0"
 ]
 classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: Microsoft :: Windows",
-  "Topic :: Security",
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
   "Intended Audience :: Information Technology",
-  "Intended Audience :: Developers"
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: Software Development :: Disassemblers",
+  "Topic :: Utilities"
 ]
 
+[project.urls]
+Homepage = "https://github.com/dwexi/entropystrip"
+Repository = "https://github.com/dwexi/entropystrip"
+Issues = "https://github.com/dwexi/entropystrip/issues"
+
 [project.scripts]
-entropystrip = "main:main"
+entropystrip = "entropystrip.core:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["entropystrip*"]
