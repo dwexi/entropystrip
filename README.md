@@ -47,7 +47,7 @@ pip install -e .
 ## Usage
 
 ```text
-usage: main.py [-h] [-r] [--dump] [--deep] [--html HTML] [--json JSON] target
+usage: entropystrip [-h] [-r] [--dump] [--deep] [--html HTML] [--json JSON] target
 
 EntropyStrip: PE De-obfuscator & Triage Engine
 
