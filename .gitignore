@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Extracted payloads & test dumps
+extracted_payloads/
+stress_samples/
+evasion_poc.exe
+*.bin
+*.html
+*.json
+upx.zip
+upx-4.2.4-win64/
+simulated_malware.exe
+
+# Environment
+.venv/
+env/
+venv/

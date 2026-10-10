@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entropystrip"
+version = "2.0.0"
+authors = [
+  { name = "EntropyStrip Security Research Team" }
+]
+description = "Algorithmic PE De-obfuscator, Shannon Entropy Scanner, and Incident Triage Engine"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "pefile>=2024.8.26",
+  "rich>=13.7.0"
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Security",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: Developers"
+]
+
+[project.scripts]
+entropystrip = "main:main"

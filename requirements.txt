@@ -1,0 +1,3 @@
+pefile
+rich
+numpy
