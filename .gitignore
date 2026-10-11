@@ -21,6 +21,9 @@ upx-4.2.4-win64/
 simulated_malware.exe
 poc_tests/
 poc_generator.py
+poc_tests_suite/
+run_audit_evaluation.py
+test_limit_suite.py
 
 # Environment
 .venv/

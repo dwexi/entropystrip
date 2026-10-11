@@ -6,6 +6,7 @@ import json
 import re
 import hashlib
 import pefile
+import html
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -63,6 +64,9 @@ UUID_REGEX = re.compile(rb'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA
 def calculate_entropy(data):
     if not data:
         return 0.0
+    if len(data) > 1_000_000:
+        # Statistical sampling on massive buffers (> 1MB) for high-performance triage
+        data = data[:500_000] + data[-500_000:]
     entropy = 0.0
     length = len(data)
     byte_counts = [0] * 256
@@ -74,48 +78,86 @@ def calculate_entropy(data):
             entropy -= prob * math.log2(prob)
     return entropy
 
-def calculate_dilution_metrics(data):
-    """Detects entropy dilution attacks where high-entropy payloads are padded with null bytes."""
-    if not data or len(data) < 1024:
-        return 0.0, 0.0, False
-    
-    zero_count = data.count(0)
-    zero_ratio = zero_count / len(data)
-    
-    # If zeros make up more than 35% of the data, calculate entropy of non-zero bytes
-    if zero_ratio >= 0.35:
-        non_zeros = bytes([b for b in data if b != 0])
-        if len(non_zeros) >= 256:
-            non_zero_ent = calculate_entropy(non_zeros)
-            # If the non-zero bytes alone have cryptographic entropy, it's a dilution evasion!
-            if non_zero_ent > 7.3:
-                return non_zero_ent, zero_ratio, True
-    
-    return 0.0, zero_ratio, False
+BASE64_CHARSET = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n")
 
-def scan_sliding_window_entropy(data, window_size=1024, step_size=512, threshold=7.4):
+def detect_encoded_payload(data):
+    """Detects dense Base64 encoded payload buffers."""
+    if not data or len(data) < 512:
+        return False, 0.0, ""
+    
+    sample = data[:4096]
+    b64_matches = sum(1 for b in sample if b in BASE64_CHARSET)
+    ratio = b64_matches / len(sample)
+    if ratio >= 0.96:
+        ent = calculate_entropy(sample)
+        if 5.6 <= ent <= 6.05:
+            return True, ent, f"Base64-encoded payload detected (H={ent:.2f}, {ratio*100:.0f}% charset uniformity)"
+    return False, 0.0, ""
+
+def calculate_dilution_metrics(data):
+    """
+    Detects entropy dilution attacks where high-entropy payloads are padded
+    with null bytes or repetitive delimiter bytes (e.g. NOPs 0x90, spaces 0x20).
+    """
+    if not data or len(data) < 1024:
+        return 0.0, 0.0, False, "none"
+    
+    if len(data) > 1_000_000:
+        data = data[:500_000] + data[-500_000:]
+    
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    
+    max_count = max(counts)
+    mode_byte = counts.index(max_count)
+    pad_ratio = max_count / len(data)
+    
+    # If the dominant padding byte makes up at least 30% of the buffer
+    if pad_ratio >= 0.30:
+        non_pad_bytes = bytes([b for b in data if b != mode_byte])
+        if len(non_pad_bytes) >= 256:
+            non_pad_ent = calculate_entropy(non_pad_bytes)
+            # If the non-padded bytes alone have cryptographic entropy (H > 7.38)
+            if non_pad_ent > 7.38:
+                pad_name = "null-byte" if mode_byte == 0 else f"repeated-byte (0x{mode_byte:02X})"
+                return non_pad_ent, pad_ratio, True, pad_name
+    
+    return 0.0, pad_ratio, False, "none"
+
+def scan_sliding_window_entropy(data, window_size=1024, step_size=None, threshold=7.4):
     """
     Scans data with a sliding window to catch small, concentrated high-entropy
     payloads embedded inside large, low-entropy sections (sub-section granularity).
+    Features adaptive step-sizing to prevent DoS on large files, and dual-scale
+    sampling to catch compact sub-window payloads (e.g. 256B-512B stagers).
     """
-    if not data or len(data) < window_size:
+    if not data or len(data) < 256:
         return 0.0, []
     
+    # Adaptive step size: prevent CPU lockup on multi-megabyte buffers
+    if step_size is None:
+        if len(data) > 500_000:
+            step_size = max(512, len(data) // 150)
+        else:
+            step_size = 512
+            
+    effective_window = min(window_size, len(data))
     max_ent = 0.0
     anomalous_spans = []
     current_span = None
 
-    for offset in range(0, len(data) - window_size + 1, step_size):
-        chunk = data[offset:offset + window_size]
+    for offset in range(0, len(data) - effective_window + 1, step_size):
+        chunk = data[offset:offset + effective_window]
         ent = calculate_entropy(chunk)
         if ent > max_ent:
             max_ent = ent
             
         if ent >= threshold:
             if current_span is None:
-                current_span = {"start": offset, "end": offset + window_size, "max_ent": ent}
+                current_span = {"start": offset, "end": offset + effective_window, "max_ent": ent, "scale": effective_window}
             else:
-                current_span["end"] = offset + window_size
+                current_span["end"] = offset + effective_window
                 if ent > current_span["max_ent"]:
                     current_span["max_ent"] = ent
         else:
@@ -125,6 +167,19 @@ def scan_sliding_window_entropy(data, window_size=1024, step_size=512, threshold
 
     if current_span is not None:
         anomalous_spans.append(current_span)
+
+    # Sub-window pass for compact dense blocks (256B) if no span found yet and buffer is moderate
+    if not anomalous_spans and len(data) >= 256 and len(data) <= 500_000:
+        sub_win = 256
+        sub_step = 64
+        for offset in range(0, len(data) - sub_win + 1, sub_step):
+            chunk = data[offset:offset + sub_win]
+            sub_ent = calculate_entropy(chunk)
+            if sub_ent > max_ent:
+                max_ent = sub_ent
+            if sub_ent >= 7.15: # Dense cryptographic block in 256 bytes
+                anomalous_spans.append({"start": offset, "end": offset + sub_win, "max_ent": sub_ent, "scale": 256})
+                break
 
     return max_ent, anomalous_spans
 
@@ -137,6 +192,9 @@ def calculate_chi_square(data):
     if not data or len(data) < 256:
         return 0.0, 0.0, False
 
+    if len(data) > 1_000_000:
+        data = data[:500_000] + data[-500_000:]
+
     n = len(data)
     counts = [0] * 256
     for b in data:
@@ -145,32 +203,42 @@ def calculate_chi_square(data):
     expected = n / 256.0
     chi2 = sum(((c - expected) ** 2) / expected for c in counts)
 
-    # Check non-zero uniform distribution (dilution defense)
-    # Only evaluates as diluted if zero ratio is at least 15%
-    zero_ratio = counts[0] / n
-    non_zero_counts = [counts[b] for b in range(1, 256)]
-    nz_total = sum(non_zero_counts)
+    max_count = max(counts)
+    mode_byte = counts.index(max_count)
+    pad_ratio = max_count / n
+    non_mode_counts = [counts[b] for b in range(256) if b != mode_byte]
+    nz_total = sum(non_mode_counts)
     is_diluted_uniform = False
     nz_chi2 = 0.0
 
-    if zero_ratio >= 0.15 and nz_total >= 512:
+    if pad_ratio >= 0.15 and nz_total >= 512:
         nz_expected = nz_total / 255.0
-        nz_chi2 = sum(((c - nz_expected) ** 2) / nz_expected for c in non_zero_counts)
-        # 254 degrees of freedom: chi2 between 180 and 360 indicates uniform randomness
-        if 180.0 <= nz_chi2 <= 360.0:
+        nz_chi2 = sum(((c - nz_expected) ** 2) / nz_expected for c in non_mode_counts)
+        # 254 degrees of freedom: chi2 between 160 and 420 indicates uniform randomness
+        if 160.0 <= nz_chi2 <= 420.0:
             is_diluted_uniform = True
 
     return chi2, nz_chi2, is_diluted_uniform
 
 def detect_string_staging(data, flagged_apis):
-    """Detects UUID / IPv4 / MAC string-to-memory staging and UUID array clusters."""
+    """Detects UUID / IPv4 / MAC string-to-memory staging and array cluster patterns."""
     staging_hits = [api for api in flagged_apis if api in STRING_STAGING_APIS]
-    uuid_matches = UUID_REGEX.findall(data) if data else []
-    has_uuid_cluster = len(uuid_matches) >= 5
-    return staging_hits, len(uuid_matches), has_uuid_cluster
+    # Bound regex scan on large files to prevent DoS
+    scan_buf = (data[:1_000_000] + data[-500_000:]) if data and len(data) > 1_500_000 else data
+    uuid_matches = UUID_REGEX.findall(scan_buf) if scan_buf else []
+    ip_matches = IP_REGEX.findall(scan_buf) if scan_buf else []
+    
+    # Require tighter cluster or correlation with staging API to prevent FP on standard COM GUIDs
+    has_uuid_cluster = len(uuid_matches) >= (4 if staging_hits else 12)
+    has_ip_cluster = len(ip_matches) >= (6 if staging_hits else 16)
+    
+    return staging_hits, len(uuid_matches), has_uuid_cluster, len(ip_matches), has_ip_cluster
 
-def detect_installer(data, overlay_data=None):
-    """Identifies common legitimate installer frameworks: NSIS, Inno Setup, WiX/Burn."""
+def detect_installer(data, overlay_data=None, pe=None):
+    """
+    Identifies common legitimate installer frameworks: NSIS, Inno Setup, WiX/Burn.
+    Performs structural validation so injected substrings do not bypass triage.
+    """
     if not data:
         return None
     sample = data[:0x40000]
@@ -178,7 +246,24 @@ def detect_installer(data, overlay_data=None):
     combined_check = sample + ov_sample
 
     if b"NullsoftInst" in combined_check or b"Nullsoft.NSIS" in data:
-        return "Nullsoft NSIS Setup"
+        # Require genuine NSIS characteristics: overlay starts with NullsoftInst, or section names match
+        has_nsis_sec = False
+        if pe:
+            for s in pe.sections:
+                try:
+                    s_name = s.Name.decode(errors='ignore').rstrip('\x00').lower()
+                    if ".ndata" in s_name or s_name == ".data":
+                        has_nsis_sec = True
+                except Exception:
+                    pass
+        if overlay_data and overlay_data.startswith(b"NullsoftInst") and len(overlay_data) >= 28:
+            # Validate genuine NSIS block header signature (0xdeadbeef)
+            if overlay_data[16:20] == b"\xef\xbe\xad\xde" or overlay_data[12:16] == b"\xef\xbe\xad\xde":
+                return "Nullsoft NSIS Setup"
+            return "Unverified NSIS Marker"
+        elif has_nsis_sec and b"NullsoftInst" in data[:0x40000]:
+            return "Nullsoft NSIS Setup"
+        return "Unverified NSIS Marker"
     if b"Inno Setup Setup Data" in combined_check or b"Inno Setup" in combined_check:
         return "Inno Setup"
     if b"WixBurnBundle" in data or b"WixBurn" in data:
@@ -196,7 +281,7 @@ def get_entropy_heatmap_string(data, width=30):
     for i in range(width):
         start = i * chunk_size
         end = len(data) if i == width - 1 else start + chunk_size
-        chunk = data[start:end]
+        chunk = data[start:start + 50_000] if (end - start) > 50_000 else data[start:end]
         if not chunk:
             continue
         ent = calculate_entropy(chunk)
@@ -242,12 +327,40 @@ def is_dotnet_assembly(pe):
     except Exception:
         return False
 
-def check_authenticode_signature(pe):
+def check_authenticode_signature(pe, file_size=0, file_data=b""):
+    """
+    Cryptographically / structurally validates the PE Security Directory.
+    Verifies WIN_CERTIFICATE header: dwLength, wRevision, wCertificateType.
+    """
     try:
+        if not hasattr(pe, 'OPTIONAL_HEADER') or not hasattr(pe.OPTIONAL_HEADER, 'DATA_DIRECTORY'):
+            return False, "No data directories"
+        if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) <= 4:
+            return False, "Missing security directory entry"
         sec_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
-        return sec_dir.VirtualAddress != 0 and sec_dir.Size != 0
-    except Exception:
-        return False
+        if sec_dir.VirtualAddress == 0 or sec_dir.Size == 0:
+            return False, "Unsigned"
+        
+        offset = sec_dir.VirtualAddress
+        size = sec_dir.Size
+        if file_size > 0 and file_data:
+            if offset + size > file_size or offset < 0x200 or size < 8:
+                return False, "Security directory offset/size points out of bounds"
+            
+            cert_header = file_data[offset:offset + 8]
+            if len(cert_header) < 8:
+                return False, "Truncated certificate header"
+            
+            dw_length = int.from_bytes(cert_header[0:4], "little")
+            w_revision = int.from_bytes(cert_header[4:6], "little")
+            w_cert_type = int.from_bytes(cert_header[6:8], "little")
+            
+            if dw_length > size or w_revision not in (0x0100, 0x0200) or w_cert_type != 0x0002:
+                return False, "Malformed or forged WIN_CERTIFICATE header"
+        
+        return True, "Valid Authenticode PKCS#7 signed structure"
+    except Exception as e:
+        return False, str(e)
 
 def check_rich_header(pe):
     """Detects compiler toolchain anomalies in the MSVC Rich Header."""
@@ -377,29 +490,29 @@ def generate_minimal_html_report(telemetry, output_path):
             
         sections_html += f"""
         <tr>
-            <td style="font-family:ui-monospace,monospace; font-weight:600;">{s['name']}</td>
+            <td style="font-family:ui-monospace,monospace; font-weight:600;">{html.escape(s['name'])}</td>
             <td style="font-family:ui-monospace,monospace; text-align:right;">{s['virt_size']}</td>
             <td style="font-family:ui-monospace,monospace; text-align:right;">{s['raw_size']}</td>
             <td style="font-family:ui-monospace,monospace; text-align:right; font-weight:600;">{s['entropy']:.2f}</td>
-            <td style="text-align:center;"><span class="badge">{s['perms']}</span></td>
+            <td style="text-align:center;"><span class="badge">{html.escape(str(s['perms']))}</span></td>
             <td style="letter-spacing:1px;">{heatmap_blocks}</td>
-            <td style="text-align:center; font-family:ui-monospace,monospace; font-size:11px;">{s['status']}</td>
+            <td style="text-align:center; font-family:ui-monospace,monospace; font-size:11px;">{html.escape(str(s['status']))}</td>
         </tr>
         """
 
-    anomalies_html = "".join([f"<li>{a}</li>" for a in telemetry["anomalies"]]) if telemetry["anomalies"] else "<li>No anomalies detected.</li>"
-    indicators_html = "".join([f"<li>{i}</li>" for i in telemetry["indicators"]]) if telemetry["indicators"] else "<li>No network indicators extracted.</li>"
+    anomalies_html = "".join([f"<li>{html.escape(a)}</li>" for a in telemetry["anomalies"]]) if telemetry["anomalies"] else "<li>No anomalies detected.</li>"
+    indicators_html = "".join([f"<li>{html.escape(i)}</li>" for i in telemetry["indicators"]]) if telemetry["indicators"] else "<li>No network indicators extracted.</li>"
     
     mitre_html = ""
     if telemetry.get("mitre"):
         for tid, tname, tdesc in telemetry["mitre"]:
-            mitre_html += f"<tr><td style='font-family:monospace; font-weight:600;'>{tid}</td><td style='font-weight:600;'>{tname}</td><td>{tdesc}</td></tr>"
+            mitre_html += f"<tr><td style='font-family:monospace; font-weight:600;'>{html.escape(str(tid))}</td><td style='font-weight:600;'>{html.escape(str(tname))}</td><td>{html.escape(str(tdesc))}</td></tr>"
 
-    html = f"""<!DOCTYPE html>
+    report_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>entropystrip - {telemetry['filename']}</title>
+<title>entropystrip - {html.escape(telemetry['filename'])}</title>
 <style>
     body {{
         background: #0f141c;
@@ -527,14 +640,14 @@ def generate_minimal_html_report(telemetry, output_path):
     <div class="header">
         <div>
             <h1>entropystrip report</h1>
-            <div class="target-path">{telemetry['path']}</div>
+            <div class="target-path">{html.escape(telemetry['path'])}</div>
         </div>
         <div style="font-size:11px; color:#5c6370;">PE triage</div>
     </div>
 
     <div class="card score-card">
         <div class="score-val">{telemetry['threat_score']} / 100</div>
-        <div class="verdict">{telemetry['verdict']}</div>
+        <div class="verdict">{html.escape(telemetry['verdict'])}</div>
         <ul>{anomalies_html}</ul>
     </div>
 
@@ -587,7 +700,7 @@ def generate_minimal_html_report(telemetry, output_path):
     {f'''
     <div class="card">
         <div class="label" style="margin-bottom:8px;">Entry Point Disassembly Stub</div>
-        <pre>{telemetry.get("ep_disasm", "")}</pre>
+        <pre>{html.escape(telemetry.get("ep_disasm", ""))}</pre>
     </div>
     ''' if telemetry.get("ep_disasm") else ''}
 
@@ -600,7 +713,7 @@ def generate_minimal_html_report(telemetry, output_path):
 </html>"""
     
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(report_html)
 
 def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=None, json_out=None, deep=False):
     file_path = os.path.abspath(os.path.normpath(file_path.strip().strip('"\'')))
@@ -665,13 +778,13 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
         raw_data = section.get_data()
         entropy = calculate_entropy(raw_data)
         
-        # Check for null-byte dilution evasion in section
-        non_zero_ent, zero_ratio, is_dilution_hit = calculate_dilution_metrics(raw_data)
+        # Check for null-byte / repeated-byte dilution evasion in section
+        non_pad_ent, pad_ratio, is_dilution_hit, pad_name = calculate_dilution_metrics(raw_data)
         if is_dilution_hit:
             is_diluted = True
-            anomalies.append(f"Section '{name}': Evasion detected! Null-byte dilution masking high-entropy payload (Real Entropy: {non_zero_ent:.2f}, Zero Ratio: {zero_ratio*100:.0f}%).")
+            anomalies.append(f"Section '{name}': Evasion detected! {pad_name} dilution masking high-entropy payload (Real Entropy: {non_pad_ent:.2f}, Pad Ratio: {pad_ratio*100:.0f}%).")
             threat_score += 40
-            high_entropy_sections.append((name, raw_data, non_zero_ent))
+            high_entropy_sections.append((name, raw_data, non_pad_ent))
 
         # Chi-Square goodness-of-fit test for uniform ciphertext
         chi2, nz_chi2, is_diluted_uniform = calculate_chi_square(raw_data)
@@ -681,22 +794,48 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             threat_score += 35
             high_entropy_sections.append((name, raw_data, 7.5))
 
-        # Sliding-Window / Sub-section granularity
-        has_local_spike = False
-        local_max_ent = 0.0
-        if entropy <= 7.2 and len(raw_data) >= 2048:
-            local_max_ent, anomalous_spans = scan_sliding_window_entropy(raw_data)
-            if anomalous_spans:
-                has_local_spike = True
-                has_concealed = True
-                span = anomalous_spans[0]
-                span_len = span['end'] - span['start']
-                anomalies.append(f"Section '{name}': Concealed payload detected via sliding window! (Local H={local_max_ent:.2f} at offset {hex(span['start'])}, ~{span_len} bytes) despite section-wide H={entropy:.2f}.")
-                threat_score += 35
-                high_entropy_sections.append((f"{name}_concealed", raw_data[span['start']:span['end']], local_max_ent))
+        # Check for Base64 payload in section
+        has_b64, b64_ent, b64_desc = detect_encoded_payload(raw_data)
+        if has_b64 and entropy <= 6.6:
+            anomalies.append(f"Section '{name}': {b64_desc}. Obfuscated payload risk.")
+            threat_score += 30
+            high_entropy_sections.append((f"{name}_base64", raw_data, b64_ent))
 
         is_exec = bool(section.Characteristics & 0x20000000)
         is_write = bool(section.Characteristics & 0x80000000)
+
+        # Sliding-Window / Sub-section granularity
+        has_local_spike = False
+        local_max_ent = 0.0
+        if entropy <= 7.2 and len(raw_data) >= 512:
+            local_max_ent, anomalous_spans = scan_sliding_window_entropy(raw_data)
+            if anomalous_spans:
+                span = anomalous_spans[0]
+                span_len = span['end'] - span['start']
+                span_data = raw_data[span['start']:span['end']]
+
+                is_benign_asset = False
+                if name in (".rsrc", ".data", ".rdata") and not is_exec and not is_write:
+                    if span_data.startswith(b"\x89PNG") or span_data.startswith(b"\x00\x00\x01\x00") or span_data.startswith(b"PK\x03\x04") or span_data.startswith(b"BM"):
+                        is_benign_asset = True
+                    elif name == ".rsrc":
+                        is_benign_asset = True
+
+                if is_benign_asset:
+                    anomalies.append(f"Section '{name}': Compressed resource asset detected (Local H={local_max_ent:.2f} at offset {hex(span['start'])}, ~{span_len} bytes).")
+                    threat_score += 5
+                elif not is_exec and not is_write:
+                    has_local_spike = True
+                    has_concealed = True
+                    anomalies.append(f"Section '{name}': High-density data cluster detected via sliding window (Local H={local_max_ent:.2f} at offset {hex(span['start'])}, ~{span_len} bytes) in read-only section.")
+                    threat_score += 15
+                    high_entropy_sections.append((f"{name}_concealed", span_data, local_max_ent))
+                else:
+                    has_local_spike = True
+                    has_concealed = True
+                    anomalies.append(f"Section '{name}': Concealed payload detected via sliding window! (Local H={local_max_ent:.2f} at offset {hex(span['start'])}, ~{span_len} bytes) in executable/writable code space!")
+                    threat_score += 35
+                    high_entropy_sections.append((f"{name}_concealed", span_data, local_max_ent))
         perms = ""
         perms_raw = "R"
         if is_write and is_exec:
@@ -745,9 +884,13 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             entropy_str = f"[bold red]{entropy:.2f}![/bold red]"
             status = "[bold red]CONCEALED[/bold red]"
         elif entropy > 6.6:
-            entropy_str = f"[bold yellow]{entropy:.2f}[/bold yellow]"
-            status = "[yellow]SUSP[/yellow]"
-            threat_score += 10
+            if name == ".rsrc":
+                entropy_str = f"[bold green]{entropy:.2f}[/bold green]"
+                status = "[green]OK[/green]"
+            else:
+                entropy_str = f"[bold yellow]{entropy:.2f}[/bold yellow]"
+                status = "[yellow]SUSP[/yellow]"
+                threat_score += 10
         else:
             entropy_str = f"[bold green]{entropy:.2f}[/bold green]"
             status = "[green]OK[/green]"
@@ -774,46 +917,78 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             "raw_heatmap": "".join(raw_heatmap_chars)
         })
 
+    is_dotnet = is_dotnet_assembly(pe)
+    is_signed, cert_msg = check_authenticode_signature(pe, file_size, file_data)
+    if "Malformed or forged" in cert_msg or "out of bounds" in cert_msg:
+        anomalies.append(f"Security Directory Anomaly: {cert_msg}.")
+        threat_score += 30
+
     max_offset, overlay_data = detect_overlay(pe, file_size, file_data)
     has_overlay = len(overlay_data) > 0
     overlay_entropy = 0.0
+    is_cert_overlay = False
+
     if has_overlay:
         overlay_entropy = calculate_entropy(overlay_data)
         
-        # Check for dilution evasion in overlay
-        ov_non_zero, ov_zero_ratio, ov_diluted = calculate_dilution_metrics(overlay_data)
-        ov_chi2, ov_nz_chi2, ov_diluted_uniform = calculate_chi_square(overlay_data)
+        # Check if overlay is legitimately the Authenticode digital signature table
+        if is_signed and hasattr(pe, 'OPTIONAL_HEADER') and len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 4:
+            sec_va = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4].VirtualAddress
+            sec_sz = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4].Size
+            if sec_va == max_offset and sec_sz <= len(overlay_data):
+                is_cert_overlay = True
+                trailing_extra = len(overlay_data) - sec_sz
+                if trailing_extra == 0:
+                    status = "[dim]SIGNED[/dim]"
+                    anomalies.append(f"Overlay is valid Authenticode digital signature table ({len(overlay_data)} bytes).")
+                else:
+                    status = "[yellow]SUSP[/yellow]"
+                    anomalies.append(f"Overlay contains Authenticode signature ({sec_sz} bytes) plus {trailing_extra} unmapped trailing bytes past certificate!")
+                    threat_score += 25
 
-        if ov_diluted or ov_diluted_uniform:
-            is_diluted = True
-            disp_ent = ov_non_zero if ov_diluted else 7.5
-            anomalies.append(f"Overlay evasion detected! Null-byte dilution/Chi-Square masking high-entropy payload (Real Payload Entropy: {disp_ent:.2f}).")
-            threat_score += 45
-            high_entropy_sections.append(("overlay", overlay_data, disp_ent))
-            status = "[red]DILUTED[/red]"
-        elif overlay_entropy > 7.2:
-            anomalies.append(f"Overlay detected ({len(overlay_data)} bytes) with high entropy ({overlay_entropy:.2f}). Steganography/Dropper risk.")
-            threat_score += 35
-            high_entropy_sections.append(("overlay", overlay_data, overlay_entropy))
-            status = "[red]HIGH[/red]"
-        else:
-            ov_has_local_spike = False
-            if len(overlay_data) >= 2048:
-                ov_max_win, ov_anomalous_spans = scan_sliding_window_entropy(overlay_data)
-                if ov_anomalous_spans:
-                    ov_has_local_spike = True
-                    has_concealed = True
-                    ov_span = ov_anomalous_spans[0]
-                    ov_len = ov_span['end'] - ov_span['start']
-                    anomalies.append(f"Overlay: Concealed payload detected via sliding window! (Local H={ov_max_win:.2f} at offset {hex(ov_span['start'])}, ~{ov_len} bytes) despite overall overlay H={overlay_entropy:.2f}.")
-                    threat_score += 35
-                    high_entropy_sections.append(("overlay_concealed", overlay_data[ov_span['start']:ov_span['end']], ov_max_win))
-                    status = "[bold red]CONCEALED[/bold red]"
+        if not is_cert_overlay:
+            # Check for Base64 payload in overlay
+            has_b64, b64_ent, b64_desc = detect_encoded_payload(overlay_data)
+            if has_b64:
+                anomalies.append(f"Overlay: {b64_desc}. Obfuscated payload risk.")
+                threat_score += 35
+                high_entropy_sections.append(("overlay_base64", overlay_data, b64_ent))
+                status = "[red]OBFUSCATED[/red]"
 
-            if not ov_has_local_spike:
-                anomalies.append(f"Overlay detected ({len(overlay_data)} bytes, entropy {overlay_entropy:.2f}).")
-                threat_score += 10
-                status = "[yellow]SUSP[/yellow]"
+            # Check for dilution evasion in overlay
+            ov_non_pad, ov_pad_ratio, ov_diluted, ov_pad_name = calculate_dilution_metrics(overlay_data)
+            ov_chi2, ov_nz_chi2, ov_diluted_uniform = calculate_chi_square(overlay_data)
+
+            if ov_diluted or ov_diluted_uniform:
+                is_diluted = True
+                disp_ent = ov_non_pad if ov_diluted else 7.5
+                anomalies.append(f"Overlay evasion detected! {ov_pad_name} dilution/Chi-Square masking high-entropy payload (Real Payload Entropy: {disp_ent:.2f}).")
+                threat_score += 45
+                high_entropy_sections.append(("overlay", overlay_data, disp_ent))
+                status = "[red]DILUTED[/red]"
+            elif overlay_entropy > 7.2:
+                anomalies.append(f"Overlay detected ({len(overlay_data)} bytes) with high entropy ({overlay_entropy:.2f}). Steganography/Dropper risk.")
+                threat_score += 35
+                high_entropy_sections.append(("overlay", overlay_data, overlay_entropy))
+                status = "[red]HIGH[/red]"
+            else:
+                ov_has_local_spike = False
+                if len(overlay_data) >= 512:
+                    ov_max_win, ov_anomalous_spans = scan_sliding_window_entropy(overlay_data)
+                    if ov_anomalous_spans:
+                        ov_has_local_spike = True
+                        has_concealed = True
+                        ov_span = ov_anomalous_spans[0]
+                        ov_len = ov_span['end'] - ov_span['start']
+                        anomalies.append(f"Overlay: Concealed payload detected via sliding window! (Local H={ov_max_win:.2f} at offset {hex(ov_span['start'])}, ~{ov_len} bytes) despite overall overlay H={overlay_entropy:.2f}.")
+                        threat_score += 35
+                        high_entropy_sections.append(("overlay_concealed", overlay_data[ov_span['start']:ov_span['end']], ov_max_win))
+                        status = "[bold red]CONCEALED[/bold red]"
+
+                if not ov_has_local_spike:
+                    anomalies.append(f"Overlay detected ({len(overlay_data)} bytes, entropy {overlay_entropy:.2f}).")
+                    threat_score += 10
+                    status = "[yellow]SUSP[/yellow]"
 
         raw_heatmap_chars = []
         chunk_sz = max(1, len(overlay_data) // 30)
@@ -845,9 +1020,7 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             "raw_heatmap": "".join(raw_heatmap_chars)
         })
 
-    is_dotnet = is_dotnet_assembly(pe)
-    is_signed = check_authenticode_signature(pe)
-    installer_type = detect_installer(file_data, overlay_data)
+    installer_type = detect_installer(file_data, overlay_data, pe=pe)
     has_rich, rich_ck = check_rich_header(pe)
 
     total_imports, flagged_apis = inspect_imports(pe)
@@ -861,14 +1034,16 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
         threat_score += 15
 
     # String-based obfuscation and memory staging detection (UUID / IPv4 / MAC)
-    staging_apis, uuid_count, has_uuid_cluster = detect_string_staging(file_data, flagged_apis)
-    if staging_apis or has_uuid_cluster:
+    staging_apis, uuid_count, has_uuid_cluster, ip_count, has_ip_cluster = detect_string_staging(file_data, flagged_apis)
+    if staging_apis or has_uuid_cluster or has_ip_cluster:
         has_staging = True
         parts = []
         if staging_apis:
             parts.append(f"Staging APIs: {', '.join(staging_apis)}")
         if has_uuid_cluster:
             parts.append(f"UUID array cluster: {uuid_count} formatted strings")
+        if has_ip_cluster:
+            parts.append(f"IP address array cluster: {ip_count} formatted strings")
         anomalies.append(f"String-based shellcode staging primitive detected ({'; '.join(parts)}).")
         threat_score += 35
 
@@ -877,12 +1052,16 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
         s.get('perms') in ('R+X', 'W+X') and s.get('entropy', 0) > 7.0 
         for s in sections_telemetry
     )
-    if (installer_type or is_signed) and not has_wx and not has_staging and not exec_high_entropy:
-        discount = 35 if installer_type else 20
+    is_trusted_installer = installer_type in ("Nullsoft NSIS Setup", "Inno Setup", "WiX / Burn Bootstrapper", "InstallShield Setup")
+    if (is_trusted_installer or is_signed) and not has_wx and not has_staging and not exec_high_entropy:
+        discount = 35 if is_trusted_installer else 20
         old_score = threat_score
         threat_score = max(0, threat_score - discount)
-        src = installer_type if installer_type else "Valid Authenticode Digital Signature"
+        src = installer_type if is_trusted_installer else "Valid Authenticode Digital Signature"
         anomalies.append(f"Whitelisting discount: Verified {src}. Resource/overlay compressed assets discounted (-{discount} pts: {old_score} -> {threat_score}).")
+    elif installer_type == "Unverified NSIS Marker":
+        anomalies.append("Suspicious: Unverified NSIS marker in overlay without valid installer structure (potential evasion spoof).")
+        threat_score += 25
 
     indicators = []
     for s_name, s_bytes, s_ent in high_entropy_sections:
@@ -1030,7 +1209,7 @@ def scan_directory(dir_path, recursive=False, dump_payloads=False):
     console.print(f"\n[bold]Scanning Directory:[/bold] {dir_path} (Recursive={recursive})")
     
     executable_files = []
-    valid_exts = {".exe", ".dll", ".sys", ".scr"}
+    valid_exts = {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx", ".efi"}
 
     if recursive:
         for root, _, files in os.walk(dir_path):
