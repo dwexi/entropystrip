@@ -146,12 +146,14 @@ def calculate_chi_square(data):
     chi2 = sum(((c - expected) ** 2) / expected for c in counts)
 
     # Check non-zero uniform distribution (dilution defense)
+    # Only evaluates as diluted if zero ratio is at least 15%
+    zero_ratio = counts[0] / n
     non_zero_counts = [counts[b] for b in range(1, 256)]
     nz_total = sum(non_zero_counts)
     is_diluted_uniform = False
     nz_chi2 = 0.0
 
-    if nz_total >= 512:
+    if zero_ratio >= 0.15 and nz_total >= 512:
         nz_expected = nz_total / 255.0
         nz_chi2 = sum(((c - nz_expected) ** 2) / nz_expected for c in non_zero_counts)
         # 254 degrees of freedom: chi2 between 180 and 360 indicates uniform randomness
@@ -167,18 +169,21 @@ def detect_string_staging(data, flagged_apis):
     has_uuid_cluster = len(uuid_matches) >= 5
     return staging_hits, len(uuid_matches), has_uuid_cluster
 
-def detect_installer(data, pe=None):
+def detect_installer(data, overlay_data=None):
     """Identifies common legitimate installer frameworks: NSIS, Inno Setup, WiX/Burn."""
     if not data:
         return None
-    sample = data[:0x20000]
-    if b"NullsoftInst" in sample or b"Nullsoft.NSIS" in data:
+    sample = data[:0x40000]
+    ov_sample = overlay_data[:0x4000] if overlay_data else b""
+    combined_check = sample + ov_sample
+
+    if b"NullsoftInst" in combined_check or b"Nullsoft.NSIS" in data:
         return "Nullsoft NSIS Setup"
-    if b"Inno Setup Setup Data" in data or b"Inno Setup" in sample:
+    if b"Inno Setup Setup Data" in combined_check or b"Inno Setup" in combined_check:
         return "Inno Setup"
     if b"WixBurnBundle" in data or b"WixBurn" in data:
         return "WiX / Burn Bootstrapper"
-    if b"InstallShield" in sample:
+    if b"InstallShield" in combined_check:
         return "InstallShield Setup"
     return None
 
@@ -792,9 +797,23 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             high_entropy_sections.append(("overlay", overlay_data, overlay_entropy))
             status = "[red]HIGH[/red]"
         else:
-            anomalies.append(f"Overlay detected ({len(overlay_data)} bytes, entropy {overlay_entropy:.2f}).")
-            threat_score += 10
-            status = "[yellow]SUSP[/yellow]"
+            ov_has_local_spike = False
+            if len(overlay_data) >= 2048:
+                ov_max_win, ov_anomalous_spans = scan_sliding_window_entropy(overlay_data)
+                if ov_anomalous_spans:
+                    ov_has_local_spike = True
+                    has_concealed = True
+                    ov_span = ov_anomalous_spans[0]
+                    ov_len = ov_span['end'] - ov_span['start']
+                    anomalies.append(f"Overlay: Concealed payload detected via sliding window! (Local H={ov_max_win:.2f} at offset {hex(ov_span['start'])}, ~{ov_len} bytes) despite overall overlay H={overlay_entropy:.2f}.")
+                    threat_score += 35
+                    high_entropy_sections.append(("overlay_concealed", overlay_data[ov_span['start']:ov_span['end']], ov_max_win))
+                    status = "[bold red]CONCEALED[/bold red]"
+
+            if not ov_has_local_spike:
+                anomalies.append(f"Overlay detected ({len(overlay_data)} bytes, entropy {overlay_entropy:.2f}).")
+                threat_score += 10
+                status = "[yellow]SUSP[/yellow]"
 
         raw_heatmap_chars = []
         chunk_sz = max(1, len(overlay_data) // 30)
@@ -828,7 +847,7 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
 
     is_dotnet = is_dotnet_assembly(pe)
     is_signed = check_authenticode_signature(pe)
-    installer_type = detect_installer(file_data, pe)
+    installer_type = detect_installer(file_data, overlay_data)
     has_rich, rich_ck = check_rich_header(pe)
 
     total_imports, flagged_apis = inspect_imports(pe)
@@ -858,7 +877,7 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
         s.get('perms') in ('R+X', 'W+X') and s.get('entropy', 0) > 7.0 
         for s in sections_telemetry
     )
-    if (installer_type or is_signed) and not has_wx and not is_diluted and not has_staging and not exec_high_entropy:
+    if (installer_type or is_signed) and not has_wx and not has_staging and not exec_high_entropy:
         discount = 35 if installer_type else 20
         old_score = threat_score
         threat_score = max(0, threat_score - discount)

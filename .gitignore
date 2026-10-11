@@ -19,6 +19,8 @@ evasion_poc.exe
 upx.zip
 upx-4.2.4-win64/
 simulated_malware.exe
+poc_tests/
+poc_generator.py
 
 # Environment
 .venv/
