@@ -33,12 +33,20 @@ ___________       __                               _________ __         .__
         \/     \/                   |__|   \/            \/                |__|    
 """
 
+STRING_STAGING_APIS = {
+    "UuidFromStringA", "UuidFromStringW", 
+    "RtlIpv4StringToAddressA", "RtlIpv4StringToAddressW", 
+    "RtlIpv6StringToAddressA", "RtlIpv6StringToAddressW", 
+    "RtlEthernetStringToAddressA", "CLSIDFromString"
+}
+
 SUSPICIOUS_APIS = {
     "VirtualAlloc", "VirtualProtect", "WriteProcessMemory", 
     "CreateRemoteThread", "LoadLibraryA", "LoadLibraryW", 
     "GetProcAddress", "IsDebuggerPresent", "CreateProcessW",
     "NtUnmapViewOfSection", "QueueUserAPC", "SetWindowsHookExA",
-    "CheckRemoteDebuggerPresent", "OutputDebugStringA", "FindWindowA"
+    "CheckRemoteDebuggerPresent", "OutputDebugStringA", "FindWindowA",
+    *STRING_STAGING_APIS
 }
 
 ANTI_DEBUG_APIS = {
@@ -50,6 +58,7 @@ KNOWN_PACKER_SECTIONS = {"upx0", "upx1", "upx2", ".aspack", ".mpress", "pecrypt"
 
 URL_REGEX = re.compile(rb'https?://[a-zA-Z0-9_\-\./:]+')
 IP_REGEX = re.compile(rb'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
+UUID_REGEX = re.compile(rb'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 def calculate_entropy(data):
     if not data:
@@ -83,6 +92,95 @@ def calculate_dilution_metrics(data):
                 return non_zero_ent, zero_ratio, True
     
     return 0.0, zero_ratio, False
+
+def scan_sliding_window_entropy(data, window_size=1024, step_size=512, threshold=7.4):
+    """
+    Scans data with a sliding window to catch small, concentrated high-entropy
+    payloads embedded inside large, low-entropy sections (sub-section granularity).
+    """
+    if not data or len(data) < window_size:
+        return 0.0, []
+    
+    max_ent = 0.0
+    anomalous_spans = []
+    current_span = None
+
+    for offset in range(0, len(data) - window_size + 1, step_size):
+        chunk = data[offset:offset + window_size]
+        ent = calculate_entropy(chunk)
+        if ent > max_ent:
+            max_ent = ent
+            
+        if ent >= threshold:
+            if current_span is None:
+                current_span = {"start": offset, "end": offset + window_size, "max_ent": ent}
+            else:
+                current_span["end"] = offset + window_size
+                if ent > current_span["max_ent"]:
+                    current_span["max_ent"] = ent
+        else:
+            if current_span is not None:
+                anomalous_spans.append(current_span)
+                current_span = None
+
+    if current_span is not None:
+        anomalous_spans.append(current_span)
+
+    return max_ent, anomalous_spans
+
+def calculate_chi_square(data):
+    """
+    Computes Chi-Square goodness-of-fit against a uniform distribution.
+    Detects artificially diluted ciphertext (interleaved nulls/delimiters)
+    where non-outlier byte frequencies display statistical uniformity.
+    """
+    if not data or len(data) < 256:
+        return 0.0, 0.0, False
+
+    n = len(data)
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+
+    expected = n / 256.0
+    chi2 = sum(((c - expected) ** 2) / expected for c in counts)
+
+    # Check non-zero uniform distribution (dilution defense)
+    non_zero_counts = [counts[b] for b in range(1, 256)]
+    nz_total = sum(non_zero_counts)
+    is_diluted_uniform = False
+    nz_chi2 = 0.0
+
+    if nz_total >= 512:
+        nz_expected = nz_total / 255.0
+        nz_chi2 = sum(((c - nz_expected) ** 2) / nz_expected for c in non_zero_counts)
+        # 254 degrees of freedom: chi2 between 180 and 360 indicates uniform randomness
+        if 180.0 <= nz_chi2 <= 360.0:
+            is_diluted_uniform = True
+
+    return chi2, nz_chi2, is_diluted_uniform
+
+def detect_string_staging(data, flagged_apis):
+    """Detects UUID / IPv4 / MAC string-to-memory staging and UUID array clusters."""
+    staging_hits = [api for api in flagged_apis if api in STRING_STAGING_APIS]
+    uuid_matches = UUID_REGEX.findall(data) if data else []
+    has_uuid_cluster = len(uuid_matches) >= 5
+    return staging_hits, len(uuid_matches), has_uuid_cluster
+
+def detect_installer(data, pe=None):
+    """Identifies common legitimate installer frameworks: NSIS, Inno Setup, WiX/Burn."""
+    if not data:
+        return None
+    sample = data[:0x20000]
+    if b"NullsoftInst" in sample or b"Nullsoft.NSIS" in data:
+        return "Nullsoft NSIS Setup"
+    if b"Inno Setup Setup Data" in data or b"Inno Setup" in sample:
+        return "Inno Setup"
+    if b"WixBurnBundle" in data or b"WixBurn" in data:
+        return "WiX / Burn Bootstrapper"
+    if b"InstallShield" in sample:
+        return "InstallShield Setup"
+    return None
 
 def get_entropy_heatmap_string(data, width=30):
     if not data or len(data) == 0:
@@ -228,13 +326,15 @@ def disassemble_entry_point(pe, file_data):
     except Exception as e:
         return f"[dim]Disassembly unavailable: {e}[/dim]"
 
-def map_mitre_techniques(anomalies, flagged_apis, has_wx, high_entropy, has_overlay, is_diluted):
+def map_mitre_techniques(anomalies, flagged_apis, has_wx, high_entropy, has_overlay, is_diluted, has_staging=False, has_concealed=False):
     """Maps structural and behavioral findings to MITRE ATT&CK technique IDs."""
     mitre_hits = []
-    if high_entropy or is_diluted:
-        mitre_hits.append(("T1027", "Obfuscated Files or Information", "Cryptographic entropy or null-byte dilution in payload"))
+    if high_entropy or is_diluted or has_concealed:
+        mitre_hits.append(("T1027", "Obfuscated Files or Information", "Cryptographic entropy, sliding-window spike, or null-byte dilution in payload"))
     if has_overlay:
         mitre_hits.append(("T1027.001", "Binary Padding / Steganography", "Unmapped trailing overlay appended to file"))
+    if has_staging:
+        mitre_hits.append(("T1027.002", "Software Packing (String Staging)", "UUID / IP string-to-binary dynamic staging primitives detected"))
     if has_wx:
         mitre_hits.append(("T1055", "Process Injection (Memory)", "Self-modifying W+X memory permissions"))
     
@@ -531,6 +631,8 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
     high_entropy_sections = []
     has_wx = False
     is_diluted = False
+    has_concealed = False
+    has_staging = False
     sections_telemetry = []
 
     if not quiet:
@@ -565,6 +667,28 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             anomalies.append(f"Section '{name}': Evasion detected! Null-byte dilution masking high-entropy payload (Real Entropy: {non_zero_ent:.2f}, Zero Ratio: {zero_ratio*100:.0f}%).")
             threat_score += 40
             high_entropy_sections.append((name, raw_data, non_zero_ent))
+
+        # Chi-Square goodness-of-fit test for uniform ciphertext
+        chi2, nz_chi2, is_diluted_uniform = calculate_chi_square(raw_data)
+        if is_diluted_uniform and not is_dilution_hit:
+            is_diluted = True
+            anomalies.append(f"Section '{name}': Chi-Square (χ²={nz_chi2:.1f}) confirms uniform ciphertext distribution despite low global entropy.")
+            threat_score += 35
+            high_entropy_sections.append((name, raw_data, 7.5))
+
+        # Sliding-Window / Sub-section granularity
+        has_local_spike = False
+        local_max_ent = 0.0
+        if entropy <= 7.2 and len(raw_data) >= 2048:
+            local_max_ent, anomalous_spans = scan_sliding_window_entropy(raw_data)
+            if anomalous_spans:
+                has_local_spike = True
+                has_concealed = True
+                span = anomalous_spans[0]
+                span_len = span['end'] - span['start']
+                anomalies.append(f"Section '{name}': Concealed payload detected via sliding window! (Local H={local_max_ent:.2f} at offset {hex(span['start'])}, ~{span_len} bytes) despite section-wide H={entropy:.2f}.")
+                threat_score += 35
+                high_entropy_sections.append((f"{name}_concealed", raw_data[span['start']:span['end']], local_max_ent))
 
         is_exec = bool(section.Characteristics & 0x20000000)
         is_write = bool(section.Characteristics & 0x80000000)
@@ -609,9 +733,12 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             high_entropy_sections.append((name, raw_data, entropy))
             threat_score += 35
             anomalies.append(f"Section '{name}' has high entropy ({entropy:.2f} / 8.00).")
-        elif is_dilution_hit:
+        elif is_dilution_hit or is_diluted_uniform:
             entropy_str = f"[bold red]{entropy:.2f}*[/bold red]"
             status = "[red]DILUTED[/red]"
+        elif has_local_spike:
+            entropy_str = f"[bold red]{entropy:.2f}![/bold red]"
+            status = "[bold red]CONCEALED[/bold red]"
         elif entropy > 6.6:
             entropy_str = f"[bold yellow]{entropy:.2f}[/bold yellow]"
             status = "[yellow]SUSP[/yellow]"
@@ -638,7 +765,7 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
             "raw_size": hex(section.SizeOfRawData),
             "entropy": entropy,
             "perms": perms_raw,
-            "status": "HIGH" if entropy > 7.4 else ("DILUTED" if is_dilution_hit else ("SUSP" if entropy > 6.6 else "OK")),
+            "status": "HIGH" if entropy > 7.4 else ("DILUTED" if (is_dilution_hit or is_diluted_uniform) else ("CONCEALED" if has_local_spike else ("SUSP" if entropy > 6.6 else "OK"))),
             "raw_heatmap": "".join(raw_heatmap_chars)
         })
 
@@ -650,11 +777,14 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
         
         # Check for dilution evasion in overlay
         ov_non_zero, ov_zero_ratio, ov_diluted = calculate_dilution_metrics(overlay_data)
-        if ov_diluted:
+        ov_chi2, ov_nz_chi2, ov_diluted_uniform = calculate_chi_square(overlay_data)
+
+        if ov_diluted or ov_diluted_uniform:
             is_diluted = True
-            anomalies.append(f"Overlay evasion detected! Null-byte dilution masking high-entropy payload (Real Payload Entropy: {ov_non_zero:.2f}, Zero Ratio: {ov_zero_ratio*100:.0f}%).")
+            disp_ent = ov_non_zero if ov_diluted else 7.5
+            anomalies.append(f"Overlay evasion detected! Null-byte dilution/Chi-Square masking high-entropy payload (Real Payload Entropy: {disp_ent:.2f}).")
             threat_score += 45
-            high_entropy_sections.append(("overlay", overlay_data, ov_non_zero))
+            high_entropy_sections.append(("overlay", overlay_data, disp_ent))
             status = "[red]DILUTED[/red]"
         elif overlay_entropy > 7.2:
             anomalies.append(f"Overlay detected ({len(overlay_data)} bytes) with high entropy ({overlay_entropy:.2f}). Steganography/Dropper risk.")
@@ -698,6 +828,7 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
 
     is_dotnet = is_dotnet_assembly(pe)
     is_signed = check_authenticode_signature(pe)
+    installer_type = detect_installer(file_data, pe)
     has_rich, rich_ck = check_rich_header(pe)
 
     total_imports, flagged_apis = inspect_imports(pe)
@@ -709,6 +840,30 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
     if flagged_apis:
         anomalies.append(f"Sensitive APIs: {', '.join(flagged_apis)}")
         threat_score += 15
+
+    # String-based obfuscation and memory staging detection (UUID / IPv4 / MAC)
+    staging_apis, uuid_count, has_uuid_cluster = detect_string_staging(file_data, flagged_apis)
+    if staging_apis or has_uuid_cluster:
+        has_staging = True
+        parts = []
+        if staging_apis:
+            parts.append(f"Staging APIs: {', '.join(staging_apis)}")
+        if has_uuid_cluster:
+            parts.append(f"UUID array cluster: {uuid_count} formatted strings")
+        anomalies.append(f"String-based shellcode staging primitive detected ({'; '.join(parts)}).")
+        threat_score += 35
+
+    # Installer and Authenticode whitelisting (FP reduction)
+    exec_high_entropy = any(
+        s.get('perms') in ('R+X', 'W+X') and s.get('entropy', 0) > 7.0 
+        for s in sections_telemetry
+    )
+    if (installer_type or is_signed) and not has_wx and not is_diluted and not has_staging and not exec_high_entropy:
+        discount = 35 if installer_type else 20
+        old_score = threat_score
+        threat_score = max(0, threat_score - discount)
+        src = installer_type if installer_type else "Valid Authenticode Digital Signature"
+        anomalies.append(f"Whitelisting discount: Verified {src}. Resource/overlay compressed assets discounted (-{discount} pts: {old_score} -> {threat_score}).")
 
     indicators = []
     for s_name, s_bytes, s_ent in high_entropy_sections:
@@ -727,7 +882,7 @@ def analyze_single_file(file_path, dump_payloads=False, quiet=False, html_out=No
         verdict_color = "green"
         verdict_text = "[OK] Clean / Low Risk"
 
-    mitre_techniques = map_mitre_techniques(anomalies, flagged_apis, has_wx, len(high_entropy_sections) > 0, has_overlay, is_diluted)
+    mitre_techniques = map_mitre_techniques(anomalies, flagged_apis, has_wx, len(high_entropy_sections) > 0, has_overlay, is_diluted, has_staging=has_staging, has_concealed=has_concealed)
     ep_disasm = disassemble_entry_point(pe, file_data) if deep else None
 
     if not quiet:
