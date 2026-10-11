@@ -1,5 +1,9 @@
 # entropystrip
 
+[![PyPI version](https://img.shields.io/pypi/v/entropystrip.svg?color=blue)](https://pypi.org/project/entropystrip/)
+[![Python versions](https://img.shields.io/pypi/pyversions/entropystrip.svg)](https://pypi.org/project/entropystrip/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 ```text
 ___________       __                               _________ __         .__        
 \_   _____/ _____/  |________  ____ ______ ___.__./   _____//  |________|__|_____  
@@ -14,15 +18,17 @@ ___________       __                               _________ __         .__
 
 ## What it does
 
-Most modern malware hides behind packers (like UPX, VMProtect, or Themida) or stashes encrypted payloads in PE resource directories or trailing file overlays. Rather than relying on static byte signatures, `entropystrip` evaluates:
+Most modern malware hides behind packers, obfuscated loaders, or encrypted stagers designed to slip past naive whole-file entropy scanners. Rather than relying on static byte signatures, `entropystrip` evaluates:
 
-1. **Section Entropy:** Calculates block-level Shannon entropy across every PE section to locate encrypted or compressed buffers ($H > 7.20$).
-2. **Memory Permissions:** Identifies sections marked simultaneously as Writable and Executable (`IMAGE_SCN_MEM_WRITE` and `IMAGE_SCN_MEM_EXECUTE`), which indicates self-modifying code or runtime unpackers.
-3. **PE Overlays:** Measures trailing bytes appended past the end of the last mapped section.
-4. **Import Table Size & Composition:** Flags binaries with unusually small IATs (e.g. only importing `LoadLibrary` / `GetProcAddress`) or sensitive process injection primitives (`VirtualAlloc`, `WriteProcessMemory`, `QueueUserAPC`).
-5. **.NET Classification:** Inspects the COM descriptor directory to separate managed CLR assemblies from native binaries, avoiding false positives on standard C# applications.
-6. **Payload Carving:** Extracts identified high-entropy sections or overlays straight to raw binary files on disk for further analysis.
-7. **Directory Triage:** Walks directories or drives and ranks all found binaries by threat score.
+1. **Sliding-Window Sub-Section Radar:** Dual-resolution (1024-byte and 256-byte) sliding windows detect concentrated cryptographic payloads hidden inside large low-entropy sections or overlays.
+2. **Generalized Dilution Defense & Chi-Square ($\chi^2$):** Defeats padding evasions (interleaved nulls, NOP sleds) by analyzing modal byte distributions and statistical uniformity.
+3. **String-Based Staging Primitives:** Flags memory-staging primitives (`UuidFromString`, `RtlIpv4StringToAddress`) and detects formatted UUID shellcode clusters.
+4. **Memory Permissions (W+X):** Identifies sections marked simultaneously as Writable and Executable (`IMAGE_SCN_MEM_WRITE` and `IMAGE_SCN_MEM_EXECUTE`).
+5. **Overlay & Certificate Radar:** Measures unmapped trailing bytes and structurally validates `WIN_CERTIFICATE` Authenticode tables to distinguish true certificates from droppers.
+6. **MITRE ATT&CK Mapping:** Automatically correlates findings to adversary technique IDs (`T1027`, `T1027.001`, `T1027.002`, `T1055`, `T1497`, `T1129`).
+7. **Installer Whitelisting:** Validates structural NSIS (`0xdeadbeef`) and setup headers to eliminate false positives on legitimate software.
+8. **Automated Payload Carving:** `--dump` extracts suspicious sections and overlays straight to disk for offline deobfuscation.
+9. **Directory Incident Triage:** Walks directories and ranks all binaries on an incident triage leaderboard.
 
 ---
 
