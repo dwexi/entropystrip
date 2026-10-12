@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entropystrip"
-version = "1.2.0"
+version = "1.2.1"
 authors = [
-  { name = "dwexi", email = "dwexi@users.noreply.github.com" }
+  { name = "dwexi" }
 ]
 description = "Algorithmic PE de-obfuscator, Shannon entropy radar, and incident triage engine."
 readme = "README.md"

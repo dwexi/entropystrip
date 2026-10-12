@@ -4,6 +4,8 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/entropystrip.svg)](https://pypi.org/project/entropystrip/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+A fast CLI tool for Windows PE triage, sliding-window entropy analysis, and detecting concealed payloads in loaders and crypters.
+
 ```text
 ___________       __                               _________ __         .__        
 \_   _____/ _____/  |________  ____ ______ ___.__./   _____//  |________|__|_____  
@@ -13,34 +15,42 @@ ___________       __                               _________ __         .__
         \/     \/                   |__|   \/            \/                |__|    
 ```
 
+---
+
+## Why EntropyStrip?
+
+Most quick-triage tools compute Shannon entropy across entire PE sections or whole files. Attackers exploit this averaging effect in modern loaders:
+
+* **Dilution by size:** Stashing 20 KB of encrypted shellcode inside a 1 MB `.rdata` section padded with zeros keeps the section-wide entropy below 5.5.
+* **Dilution by padding:** Interleaving ciphertext with NOP sleds (`0x90`) or repeating delimiters pulls the score down to benign code levels.
+* **String staging:** Converting shellcode into UUID arrays (`UuidFromStringA`) or IPv4 addresses (`RtlIpv4StringToAddressA`) keeps disk entropy around 4.0 until runtime reassembly.
+
+EntropyStrip addresses these blind spots with sub-section analysis and structural checks.
 
 ---
 
-## What it does
+## Key Capabilities
 
-Most modern malware hides behind packers, obfuscated loaders, or encrypted stagers designed to slip past naive whole-file entropy scanners. Rather than relying on static byte signatures, `entropystrip` evaluates:
-
-1. **Sliding-Window Sub-Section Radar:** Dual-resolution (1024-byte and 256-byte) sliding windows detect concentrated cryptographic payloads hidden inside large low-entropy sections or overlays.
-2. **Generalized Dilution Defense & Chi-Square ($\chi^2$):** Defeats padding evasions (interleaved nulls, NOP sleds) by analyzing modal byte distributions and statistical uniformity.
-3. **String-Based Staging Primitives:** Flags memory-staging primitives (`UuidFromString`, `RtlIpv4StringToAddress`) and detects formatted UUID shellcode clusters.
-4. **Memory Permissions (W+X):** Identifies sections marked simultaneously as Writable and Executable (`IMAGE_SCN_MEM_WRITE` and `IMAGE_SCN_MEM_EXECUTE`).
-5. **Overlay & Certificate Radar:** Measures unmapped trailing bytes and structurally validates `WIN_CERTIFICATE` Authenticode tables to distinguish true certificates from droppers.
-6. **MITRE ATT&CK Mapping:** Automatically correlates findings to adversary technique IDs (`T1027`, `T1027.001`, `T1027.002`, `T1055`, `T1497`, `T1129`).
-7. **Installer Whitelisting:** Validates structural NSIS (`0xdeadbeef`) and setup headers to eliminate false positives on legitimate software.
-8. **Automated Payload Carving:** `--dump` extracts suspicious sections and overlays straight to disk for offline deobfuscation.
-9. **Directory Incident Triage:** Walks directories and ranks all binaries on an incident triage leaderboard.
+* **Sliding-window inspection:** Scans sections and overlays in 1024-byte and 256-byte windows with adaptive stepping to catch concentrated payloads regardless of total section size.
+* **Dilution and Chi-Square checks:** Evaluates modal byte distribution and opcode uniformity to flag padded ciphertext.
+* **Memory staging detection:** Identifies `UuidFromString` and `RtlIpv4StringToAddress` staging primitives and clusters of formatted UUID strings.
+* **Memory permissions:** Flags self-modifying code in sections marked both Writable and Executable (W+X).
+* **Authenticode and installer verification:** Validates PE `WIN_CERTIFICATE` directory bounds and NSIS `0xdeadbeef` headers so signed software and installers are not falsely scored.
+* **Rich Header inspection:** Detects stripped or invalid MSVC Rich Headers in native binaries.
+* **Payload carving:** Use `--dump` to extract suspicious buffers directly to disk for Ghidra or x64dbg.
+* **Directory triage:** Pass a folder path to scan directories and rank binaries on an incident triage leaderboard.
 
 ---
 
 ## Installation
 
-Requirements: Python 3.8+ on Windows, Linux, or macOS.
+Requires Python 3.8+ on Windows, Linux, or macOS.
 
 ```bash
 pip install entropystrip
 ```
 
-Or install directly from source:
+Or install from source:
 
 ```bash
 git clone https://github.com/dwexi/entropystrip.git
@@ -66,7 +76,7 @@ options:
                  recursively scan subdirectories if target is a folder
   --dump         carve and write high-entropy payloads to extracted_payloads/
   --deep         deep forensic triage: MITRE ATT&CK mapping, entry point disassembly, hashes
-  --html HTML    write minimalist HTML report to specified path
+  --html HTML    write standalone HTML report to specified path
   --json JSON    write machine-readable JSON telemetry to specified path
 ```
 
@@ -74,45 +84,43 @@ options:
 
 **Analyze a single binary:**
 ```bash
-python main.py target.exe
+entropystrip target.exe
 ```
 
 **Deep forensic triage with MITRE ATT&CK mapping & disassembly:**
 ```bash
-python main.py suspicious.exe --deep
+entropystrip suspicious.exe --deep
 ```
 
-**Analyze and extract hidden payload buffers:**
+**Extract hidden payload buffers:**
 ```bash
-python main.py suspicious.exe --dump
+entropystrip suspicious.exe --dump
 ```
 Carved payloads are written to `extracted_payloads/<target>_<section>.bin`.
 
 **Export a standalone HTML report:**
 ```bash
-python main.py sample.exe --html report.html
+entropystrip sample.exe --html report.html
 ```
 
-**Triage an entire directory of unknown files:**
+**Triage an entire directory of files:**
 ```bash
-python main.py "C:\IncidentTriage" -r
+entropystrip "C:\IncidentTriage" -r
 ```
 
 ---
 
-## Entropy Scale Reference
+## Entropy Reference
 
 Shannon entropy measures information density from 0.00 to 8.00 bits per byte:
 
-$$H(X) = -\sum_{i=0}^{255} P(x_i) \log_2 P(x_i)$$
-
-| Entropy Range | Expected Content | Notes |
+| Entropy Range | Typical Content | Notes |
 |---|---|---|
-| `0.00 - 2.00` | Zero-padding, sparse tables | Common in uninitialized data or alignment padding |
-| `2.00 - 5.50` | Standard ASCII, configurations | Normal application metadata, strings |
+| `0.00 - 2.00` | Zero-padding, sparse tables | Alignment padding, uninitialized buffers |
+| `2.00 - 5.50` | Standard ASCII, configurations | Application metadata, readable strings |
 | `5.50 - 6.60` | Native compiled machine code | Standard x86/x64 instructions (`.text`) |
 | `6.60 - 7.30` | Compressed assets | Bitmaps, icons, zlib/deflate streams |
-| `7.40 - 8.00` | Cryptographic ciphertext | AES/RC4 encrypted payloads or tightly packed shellcode |
+| `7.40 - 8.00` | Cryptographic ciphertext | Encrypted payloads or packed shellcode |
 
 ---
 

@@ -2,7 +2,7 @@
 EntropyStrip: Algorithmic PE De-obfuscator, Shannon Entropy Radar, and Incident Triage Engine.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __author__ = "dwexi"
 
 from .core import (
