@@ -8,9 +8,11 @@ import argparse
 try:
     from .reporters.console import console
     from .core import analyze_single_file, scan_directory
+    from . import __version__
 except (ImportError, ValueError):
     from entropystrip.reporters.console import console
     from entropystrip.core import analyze_single_file, scan_directory
+    from entropystrip import __version__
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -35,6 +37,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="entropystrip",
         description="EntropyStrip: PE De-obfuscator, Shannon Entropy Radar, and Incident Triage Engine",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show program's version number and exit",
     )
     parser.add_argument("target", help="Path to Windows executable (.exe / .dll) or directory")
     parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scan subdirectories")

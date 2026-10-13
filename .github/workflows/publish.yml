@@ -4,17 +4,21 @@ on:
   release:
     types: [created, published]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to attach assets to (e.g. v1.2.2)"
+        required: false
+        default: "v1.2.2"
 
 permissions:
   contents: write
 
 jobs:
-  build-and-publish:
+  build-and-release:
+    name: Build Artifacts & Release on GitHub
     runs-on: windows-latest
-    env:
-      TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -23,33 +27,51 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install dependencies
+      - name: Install build tools
         run: |
           python -m pip install --upgrade pip
           pip install build pyinstaller wheel pefile rich capstone
 
-      - name: Build wheel and source distribution
+      - name: Build Python packages (wheel and sdist)
         run: |
-          python -m build
+          python -m build --outdir dist/
 
-      - name: Build standalone executable
+      - name: Build Windows standalone executable
         run: |
-          pyinstaller --onefile --name entropystrip main.py --clean
+          pyinstaller --onefile --distpath dist-bin/ --name entropystrip main.py --clean
 
-      - name: Upload artifacts to GitHub Release
+      - name: Attach artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: |
-            dist/entropystrip.exe
+            dist-bin/entropystrip.exe
             dist/*.whl
             dist/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish to PyPI
-        if: env.TWINE_PASSWORD != ''
-        env:
-          TWINE_USERNAME: __token__
-        run: |
-          pip install twine
-          twine upload dist/*.whl dist/*.tar.gz --skip-existing
+      - name: Stash Python packages for PyPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-dist
+          path: dist/
+
+  pypi-publish:
+    name: Publish to PyPI
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Download package distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: pypi-dist
+          path: dist/
+
+      - name: Publish to PyPI via Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
