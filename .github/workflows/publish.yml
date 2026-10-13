@@ -32,7 +32,7 @@ jobs:
 
       - name: Build standalone executable
         run: |
-          pyinstaller entropystrip.spec --clean
+          pyinstaller --onefile --name entropystrip main.py --clean
 
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
