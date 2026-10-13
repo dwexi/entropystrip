@@ -44,7 +44,7 @@ from .reporters.console import (
     render_console_report,
     render_triage_leaderboard,
 )
-from .reporters.html import generate_html_report
+from .reporters.html import generate_html_report, generate_directory_html_report
 
 def main() -> None:
     from .cli import main as cli_main
@@ -54,7 +54,6 @@ def main() -> None:
 __all__ = [
     "main",
     "analyze_single_file",
-
     "scan_directory",
     "calculate_entropy",
     "scan_sliding_window_entropy",
@@ -71,6 +70,7 @@ __all__ = [
     "disassemble_entry_point",
     "map_mitre_techniques",
     "generate_html_report",
+    "generate_directory_html_report",
 ]
 
 
@@ -325,6 +325,9 @@ def analyze_single_file(
     if has_overlay:
         overlay_entropy = calculate_entropy(overlay_data)
 
+        status = "[green]OK[/green]"
+        status_clean = "OK"
+
         # Validate whether overlay is strictly the Authenticode certificate table
         if is_signed and hasattr(pe, "OPTIONAL_HEADER") and len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 4:
             sec_va = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4].VirtualAddress
@@ -334,11 +337,13 @@ def analyze_single_file(
                 trailing_extra = len(overlay_data) - sec_sz
                 if trailing_extra == 0:
                     status = "[dim]SIGNED[/dim]"
+                    status_clean = "SIGNED"
                     anomalies.append(
                         f"Overlay is valid Authenticode digital signature table ({len(overlay_data)} bytes)."
                     )
                 else:
                     status = "[yellow]SUSP[/yellow]"
+                    status_clean = "SUSP"
                     anomalies.append(
                         f"Overlay contains Authenticode signature ({sec_sz} bytes) plus {trailing_extra} unmapped trailing bytes past certificate!"
                     )
@@ -352,6 +357,7 @@ def analyze_single_file(
                 threat_score += 35
                 high_entropy_sections.append(("overlay_base64", overlay_data, b64_ent))
                 status = "[red]OBFUSCATED[/red]"
+                status_clean = "OBFUSCATED"
 
             # Check for dilution evasion in overlay
             ov_non_pad, ov_pad_ratio, ov_diluted, ov_pad_name = calculate_dilution_metrics(overlay_data)
@@ -366,6 +372,7 @@ def analyze_single_file(
                 threat_score += 45
                 high_entropy_sections.append(("overlay", overlay_data, disp_ent))
                 status = "[red]DILUTED[/red]"
+                status_clean = "DILUTED"
             elif overlay_entropy > 7.2:
                 anomalies.append(
                     f"Overlay detected ({len(overlay_data)} bytes) with high entropy ({overlay_entropy:.2f}). Steganography/Dropper risk."
@@ -373,6 +380,7 @@ def analyze_single_file(
                 threat_score += 35
                 high_entropy_sections.append(("overlay", overlay_data, overlay_entropy))
                 status = "[red]HIGH[/red]"
+                status_clean = "HIGH"
             else:
                 ov_has_local_spike = False
                 if len(overlay_data) >= 512:
@@ -390,11 +398,13 @@ def analyze_single_file(
                             ("overlay_concealed", overlay_data[ov_span["start"] : ov_span["end"]], ov_max_win)
                         )
                         status = "[bold red]CONCEALED[/bold red]"
+                        status_clean = "CONCEALED"
 
                 if not ov_has_local_spike:
                     anomalies.append(f"Overlay detected ({len(overlay_data)} bytes, entropy {overlay_entropy:.2f}).")
                     threat_score += 10
                     status = "[yellow]SUSP[/yellow]"
+                    status_clean = "SUSP"
 
         raw_heatmap_chars = []
         chunk_sz = max(1, len(overlay_data) // 30)
@@ -427,7 +437,7 @@ def analyze_single_file(
                 "raw_size": hex(len(overlay_data)),
                 "entropy": overlay_entropy,
                 "perms": "DATA",
-                "status": status.strip("[]").replace("red", "").replace("/", ""),
+                "status": status_clean,
                 "raw_heatmap": "".join(raw_heatmap_chars),
             }
         )
@@ -576,44 +586,80 @@ def analyze_single_file(
             os.makedirs(out_dir, exist_ok=True)
         with open(json_out, "w", encoding="utf-8") as f:
             json.dump(telemetry_data, f, indent=2)
+        if not quiet:
+            console.print(f"[green][+] JSON telemetry written:[/green] {os.path.abspath(json_out)}")
 
     if html_out:
         generate_html_report(telemetry_data, html_out)
+        if not quiet:
+            console.print(f"[green][+] HTML report generated:[/green] {os.path.abspath(html_out)}")
 
     return telemetry_data
 
 
-def scan_directory(dir_path: str, recursive: bool = False, dump_payloads: bool = False) -> None:
-    """Walks directory, ranks found binaries on incident triage leaderboard."""
+def scan_directory(
+    dir_path: str,
+    recursive: bool = False,
+    dump_payloads: bool = False,
+    html_out: Optional[str] = None,
+    json_out: Optional[str] = None,
+    deep: bool = False,
+) -> List[Dict[str, Any]]:
+    """Walks directory, ranks found binaries on incident triage leaderboard, and exports HTML/JSON reports."""
     dir_path = os.path.abspath(os.path.normpath(dir_path.strip().strip('"\'')))
     if not os.path.isdir(dir_path):
         console.print(f"[red]Error: Directory not found -> {dir_path}[/red]")
-        return
+        return []
 
     console.print(f"\n[bold magenta][*] Scanning Directory:[/bold magenta] {dir_path}")
     results: List[Dict[str, Any]] = []
 
-    target_extensions = {".exe", ".dll", ".sys", ".scr", ".bin"}
+    target_extensions = {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx", ".efi", ".bin"}
 
     if recursive:
         for root, _, files in os.walk(dir_path):
             for file in files:
                 if any(file.lower().endswith(ext) for ext in target_extensions):
                     full_p = os.path.join(root, file)
-                    res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True)
+                    res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
                     if res:
                         results.append(res)
     else:
         for item in os.listdir(dir_path):
             full_p = os.path.join(dir_path, item)
             if os.path.isfile(full_p) and any(item.lower().endswith(ext) for ext in target_extensions):
-                res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True)
+                res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
                 if res:
                     results.append(res)
 
     if not results:
         console.print("[dim]No Windows PE binaries found in directory.[/dim]")
-        return
+        return []
 
     results.sort(key=lambda x: x["threat_score"], reverse=True)
     render_triage_leaderboard(results)
+
+    if json_out:
+        out_dir = os.path.dirname(os.path.abspath(json_out))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        summary = {
+            "critical": sum(1 for r in results if r.get("threat_score", 0) >= 70),
+            "suspicious": sum(1 for r in results if 35 <= r.get("threat_score", 0) < 70),
+            "clean": sum(1 for r in results if r.get("threat_score", 0) < 35),
+        }
+        directory_telemetry = {
+            "target_directory": dir_path,
+            "total_scanned": len(results),
+            "summary": summary,
+            "results": results,
+        }
+        with open(json_out, "w", encoding="utf-8") as f:
+            json.dump(directory_telemetry, f, indent=2)
+        console.print(f"[green][+] JSON telemetry written:[/green] {os.path.abspath(json_out)}")
+
+    if html_out:
+        generate_directory_html_report(results, dir_path, html_out)
+        console.print(f"[green][+] HTML report generated:[/green] {os.path.abspath(html_out)}")
+
+    return results

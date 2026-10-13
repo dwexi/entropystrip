@@ -137,15 +137,15 @@ def disassemble_entry_point(pe: pefile.PE, file_data: bytes) -> str:
     try:
         ep_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
         if ep_rva == 0:
-            return "[dim]No execution entry point (DLL resource/pure data)[/dim]"
+            return "No execution entry point (DLL resource/pure data)"
 
         ep_offset = pe.get_offset_from_rva(ep_rva)
         if ep_offset is None or ep_offset >= len(file_data):
-            return f"[red]Entry point points outside file (RVA: {hex(ep_rva)} - Header anomaly)[/red]"
+            return f"Entry point points outside file (RVA: {hex(ep_rva)} - Header anomaly)"
 
         code_bytes = file_data[ep_offset : ep_offset + 32]
         if not code_bytes:
-            return "[dim]Empty bytes at entry point[/dim]"
+            return "Empty bytes at entry point"
 
         if HAS_CAPSTONE:
             is_64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
@@ -160,9 +160,9 @@ def disassemble_entry_point(pe: pefile.PE, file_data: bytes) -> str:
             return "\n".join(lines) if lines else code_bytes.hex(" ")
         else:
             hex_str = " ".join([f"{b:02x}" for b in code_bytes[:24]])
-            return f"{hex(ep_rva)}: {hex_str} [dim](install 'capstone' for full disassembly)[/dim]"
+            return f"{hex(ep_rva)}: {hex_str} (install 'capstone' for full disassembly)"
     except Exception as e:
-        return f"[dim]Disassembly unavailable: {e}[/dim]"
+        return f"Disassembly unavailable: {e}"
 
 
 def map_mitre_techniques(

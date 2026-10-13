@@ -29,3 +29,6 @@ test_limit_suite.py
 .venv/
 env/
 venv/
+
+# AI Agent Instructions
+AGENT.md

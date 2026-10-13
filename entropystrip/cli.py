@@ -13,7 +13,10 @@ except (ImportError, ValueError):
     from entropystrip.core import analyze_single_file, scan_directory
 
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -48,7 +51,14 @@ def main() -> None:
     clean_target = os.path.abspath(os.path.normpath(args.target.strip().strip('"\'')))
 
     if os.path.isdir(clean_target):
-        scan_directory(clean_target, recursive=args.recursive, dump_payloads=args.dump)
+        scan_directory(
+            clean_target,
+            recursive=args.recursive,
+            dump_payloads=args.dump,
+            html_out=args.html,
+            json_out=args.json,
+            deep=args.deep,
+        )
     else:
         analyze_single_file(
             clean_target,
