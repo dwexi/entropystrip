@@ -958,7 +958,13 @@ def scan_directory(
         console.print(f"[green][+] JSON telemetry written:[/green] {os.path.abspath(json_out)}")
 
     if html_out:
-        generate_directory_html_report(results, dir_path, html_out)
+        generate_directory_html_report(
+            results,
+            dir_path,
+            html_out,
+            yara_enabled=(enable_yara or yara_rule_path is not None),
+            bazaar_enabled=enable_bazaar,
+        )
         console.print(f"[green][+] HTML report generated:[/green] {os.path.abspath(html_out)}")
 
     return results

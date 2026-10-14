@@ -455,7 +455,13 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
         f.write(report_html)
 
 
-def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: str, output_path: str) -> None:
+def generate_directory_html_report(
+    results: List[Dict[str, Any]],
+    target_dir: str,
+    output_path: str,
+    yara_enabled: bool = False,
+    bazaar_enabled: bool = False,
+) -> None:
     """Generates a self-contained HTML triage dashboard for a directory of binaries."""
     out_dir = os.path.dirname(os.path.abspath(output_path))
     if out_dir:
@@ -466,6 +472,8 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
     crit_count = sum(1 for r in sorted_results if r.get("threat_score", 0) >= 70)
     susp_count = sum(1 for r in sorted_results if 35 <= r.get("threat_score", 0) < 70)
     clean_count = sum(1 for r in sorted_results if r.get("threat_score", 0) < 35)
+    yara_hits_total = sum(len(r.get("yara_matches", [])) for r in sorted_results)
+    bazaar_hits_total = sum(1 for r in sorted_results if r.get("bazaar_intel") and r["bazaar_intel"].get("status") == "malicious")
 
     rows_html = ""
     details_html = ""
@@ -522,13 +530,89 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
                 [f"<li><code>{html.escape(i)}</code></li>" for i in r["indicators"]]
             ) + "</ul>"
 
+        # YARA section
+        yara_section = ""
+        yara_hits = r.get("yara_matches", [])
+        if yara_hits:
+            y_rows = "".join([
+                f"<tr><td style='color:#e06c75; font-weight:600;'>{html.escape(str(y.get('rule', y) if isinstance(y, dict) else str(y)))}</td>"
+                f"<td style='text-align:center;'><span class='badge' style='color:#e06c75;'>{html.escape(str(y.get('severity', 'HIGH')).upper() if isinstance(y, dict) else 'DETECTED')}</span></td>"
+                f"<td>{html.escape(str(y.get('description', '')) if isinstance(y, dict) else '')}</td></tr>"
+                for y in yara_hits
+            ])
+            yara_section = f"""
+            <h4 style="margin:12px 0 4px 0; font-size:11px; color:#e06c75; text-transform:uppercase;">YARA Rule Detections</h4>
+            <table style="margin-bottom:8px;">
+                <thead><tr><th>Rule Name</th><th style="text-align:center;">Severity</th><th>Description</th></tr></thead>
+                <tbody>{y_rows}</tbody>
+            </table>
+            """
+
+        # MalwareBazaar section
+        bazaar_section = ""
+        bazaar = r.get("bazaar_intel")
+        if bazaar and bazaar.get("status") == "malicious":
+            vt = bazaar.get("virustotal") or {}
+            vt_str = f"{vt.get('percent', 0.0):.1f}% ({vt.get('positives', 0)}/{vt.get('total', 0)})" if vt else "N/A"
+            bazaar_section = f"""
+            <div style="background:#1f242c; border-left:3px solid #e06c75; padding:8px 12px; margin:8px 0; border-radius:3px;">
+                <b style="color:#e06c75;">MalwareBazaar Threat Intel (abuse.ch):</b> {html.escape(str(bazaar.get('signature', 'Unknown Threat')))}
+                <span style="color:#5c6370; font-size:11px;"> | VT: {html.escape(vt_str)} | First seen: {html.escape(str(bazaar.get('first_seen', '-')))}</span>
+            </div>
+            """
+
+        # Resource Tree section (.rsrc steganography / payload)
+        rsrc_section = ""
+        susp_rsrcs = [res for res in r.get("resources_info", []) if res.get("is_suspicious") or res.get("entropy", 0) > 6.5]
+        if susp_rsrcs:
+            r_rows = "".join([
+                f"<tr><td style='font-weight:600;'>{html.escape(str(res.get('type', '')))}</td>"
+                f"<td style='font-family:monospace;'>{html.escape(str(res.get('id', '')))}</td>"
+                f"<td style='text-align:right;'>{res.get('entropy', 0.0):.2f}</td>"
+                f"<td>{html.escape(str(res.get('status', 'OK')))}</td></tr>"
+                for res in susp_rsrcs
+            ])
+            rsrc_section = f"""
+            <h4 style="margin:12px 0 4px 0; font-size:11px; color:#e5c07b; text-transform:uppercase;">Resource Tree Anomaly (.rsrc Steganography / Payload)</h4>
+            <table style="margin-bottom:8px;">
+                <thead><tr><th>Type</th><th>ID</th><th style="text-align:right;">Entropy</th><th>Status / Findings</th></tr></thead>
+                <tbody>{r_rows}</tbody>
+            </table>
+            """
+
+        # Export table proxying
+        export_section = ""
+        exp_info = r.get("exports_info") or {}
+        forwarded = exp_info.get("forwarded", [])
+        if forwarded or exp_info.get("is_masquerading"):
+            f_rows = "".join([
+                f"<tr><td style='font-family:monospace;'>{html.escape(str(f.get('function', '')))}</td>"
+                f"<td style='font-family:monospace; color:#e5c07b;'>{html.escape(str(f.get('forward_target', '')))}</td></tr>"
+                for f in forwarded
+            ])
+            masq_note = f"<div style='color:#e06c75; font-size:11px; margin-bottom:4px;'>Masquerading Anomaly: Exports match system DLL ({exp_info.get('masqueraded_dll', '')}) - Proxying Risk</div>" if exp_info.get("is_masquerading") else ""
+            export_section = f"""
+            <h4 style="margin:12px 0 4px 0; font-size:11px; color:#e5c07b; text-transform:uppercase;">Export Forwarding &amp; Proxying (EAT)</h4>
+            {masq_note}
+            <table style="margin-bottom:8px;">
+                <thead><tr><th>Function Name</th><th>Forwarded Target DLL</th></tr></thead>
+                <tbody>{f_rows}</tbody>
+            </table>
+            """
+
+        fuzzy_info = f" &nbsp;|&nbsp; SSDEEP: <span style='font-family:monospace; color:#61afef;'>{html.escape(r.get('fuzzy_hash') or '')}</span>" if r.get("fuzzy_hash") else ""
+
         details_html += f"""
         <div id="target-{idx}" class="findings-card" style="margin-top:16px;">
             <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
                 <h3 style="margin:0; font-size:14px; color:#e6edf3;">#{idx}. {html.escape(r.get('filename', ''))} <span style="color:{c}; font-size:12px;">[{score}/100 - {html.escape(r.get('verdict', ''))}]</span></h3>
                 <span style="font-size:11px; color:#5c6370;">{html.escape(r.get('path', ''))}</span>
             </div>
-            <div style="font-size:11px; color:#5c6370; margin-bottom:8px; font-family:monospace;">SHA256: {html.escape(sha256)}</div>
+            <div style="font-size:11px; color:#5c6370; margin-bottom:8px; font-family:monospace;">SHA256: {html.escape(sha256)}{fuzzy_info}</div>
+            {bazaar_section}
+            {yara_section}
+            {rsrc_section}
+            {export_section}
             <h4 style="margin:8px 0 4px 0; font-size:11px; color:#e6edf3; text-transform:uppercase;">Findings</h4>
             <ul>{anom_list}</ul>
             {indicators_list}
@@ -553,6 +637,26 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
         <div class="findings-card" style="border-left: 3px solid #61afef; margin-bottom: 24px;">
             <h4 style="color:#61afef; margin-top:0;">Automated Campaign Clusters (Fuzzy Hash Similarity &ge; 70%)</h4>
             {c_items}
+        </div>
+        """
+
+    yara_card = ""
+    if yara_enabled or yara_hits_total > 0:
+        y_color = "#e06c75" if yara_hits_total > 0 else "#98c379"
+        yara_card = f"""
+        <div class="summary-card" style="border-left: 3px solid {y_color};">
+            <div class="summary-val" style="color: {y_color};">{yara_hits_total}</div>
+            <div class="summary-label">YARA Detections</div>
+        </div>
+        """
+
+    bazaar_card = ""
+    if bazaar_enabled or bazaar_hits_total > 0:
+        b_color = "#e06c75" if bazaar_hits_total > 0 else "#98c379"
+        bazaar_card = f"""
+        <div class="summary-card" style="border-left: 3px solid {b_color};">
+            <div class="summary-val" style="color: {b_color};">{bazaar_hits_total}</div>
+            <div class="summary-label">Threat Intel Hits</div>
         </div>
         """
 
@@ -702,6 +806,8 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
             <div class="summary-val" style="color: #98c379;">{clean_count}</div>
             <div class="summary-label">Clean / Low Risk (&lt;35)</div>
         </div>
+        {yara_card}
+        {bazaar_card}
     </div>
 
     {clusters_html}
