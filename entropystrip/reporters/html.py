@@ -109,6 +109,7 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <title>EntropyStrip - {html.escape(str(telemetry.get('filename', 'Unknown')))}</title>
 <style>
     body {{
@@ -265,7 +266,7 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
             <h1>EntropyStrip Triage Diagnostic</h1>
             <div class="target-path">{html.escape(str(telemetry.get('path', '')))}</div>
         </div>
-        <div style="color: #5c6370; font-size: 11px;">v1.2.2</div>
+        <div style="color: #5c6370; font-size: 11px;">v1.2.3</div>
     </div>
 
     <div class="meta-grid">
@@ -415,7 +416,7 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
         mitre_list = ""
         if r.get("mitre"):
             mitre_list = "<h4>MITRE ATT&CK</h4><ul>" + "".join(
-                [f"<li><b>{html.escape(tid)}:</b> {html.escape(tname)} &mdash; <i>{html.escape(tdesc)}</i></li>" for tid, tname, tdesc in r["mitre"]]
+                [f"<li><b>{html.escape(tid)}:</b> {html.escape(tname)}: <i>{html.escape(tdesc)}</i></li>" for tid, tname, tdesc in r["mitre"]]
             ) + "</ul>"
 
         indicators_list = ""
@@ -443,6 +444,7 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <title>EntropyStrip - Incident Triage Leaderboard</title>
 <style>
     body {{
@@ -563,7 +565,7 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
             <h1>Incident Triage Leaderboard</h1>
             <div class="target-path">{html.escape(target_dir)}</div>
         </div>
-        <div style="color: #5c6370; font-size: 11px;">v1.2.2</div>
+        <div style="color: #5c6370; font-size: 11px;">v1.2.3</div>
     </div>
 
     <div class="summary-grid">

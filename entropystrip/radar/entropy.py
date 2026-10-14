@@ -62,7 +62,7 @@ def scan_sliding_window_entropy(
     # Scale step size on large buffers to maintain sub-second triage speeds
     if step_size is None:
         if len(data) > 500_000:
-            step_size = max(512, len(data) // 150)
+            step_size = min(1024, max(512, len(data) // 150))
         else:
             step_size = 512
 
@@ -98,10 +98,11 @@ def scan_sliding_window_entropy(
         anomalous_spans.append(current_span)
 
     # 256-byte secondary pass for compact stagers (e.g. 300-500 byte shellcode stagers)
-    if not anomalous_spans and 256 <= len(data) <= 500_000:
+    if not anomalous_spans and len(data) >= 256:
         sub_win = 256
-        sub_step = 64
-        for offset in range(0, len(data) - sub_win + 1, sub_step):
+        sub_step = 64 if len(data) <= 500_000 else 256
+        scan_limit = min(len(data), 2_000_000)
+        for offset in range(0, scan_limit - sub_win + 1, sub_step):
             chunk = data[offset : offset + sub_win]
             sub_ent = calculate_entropy(chunk)
             if sub_ent > max_ent:

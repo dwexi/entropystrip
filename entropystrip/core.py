@@ -5,9 +5,11 @@ Core analysis coordinator and public API facade for EntropyStrip.
 import os
 import sys
 import json
+import struct
 from typing import Optional, Dict, Any, List, Tuple
 import pefile
 from rich.table import Table
+from rich.markup import escape
 
 from .models import TriageDiagnostic
 from .radar.entropy import (
@@ -30,6 +32,7 @@ from .radar.signatures import (
 )
 from .scanner import (
     compute_hashes,
+    compute_file_hashes,
     inspect_imports,
     is_dotnet_assembly,
     check_rich_header,
@@ -38,6 +41,9 @@ from .scanner import (
     disassemble_entry_point,
     map_mitre_techniques,
     KNOWN_PACKER_SECTIONS,
+    sanitize_section_name,
+    detect_overlapping_sections,
+    inspect_tls_callbacks,
 )
 from .reporters.console import (
     console,
@@ -69,9 +75,26 @@ __all__ = [
     "harvest_indicators",
     "disassemble_entry_point",
     "map_mitre_techniques",
+    "sanitize_section_name",
+    "detect_overlapping_sections",
+    "inspect_tls_callbacks",
     "generate_html_report",
     "generate_directory_html_report",
 ]
+
+
+def normalize_windows_path(p: str) -> str:
+    """Normalizes path and prepends extended-length \\\\?\\ prefix on Windows if path exceeds 240 chars."""
+    if not p:
+        return p
+    clean = p.strip().strip('"\'')
+    try:
+        norm = os.path.normpath(os.path.abspath(clean))
+        if sys.platform == "win32" and not norm.startswith("\\\\?\\") and len(norm) >= 240:
+            return f"\\\\?\\{norm}"
+        return norm
+    except Exception:
+        return clean
 
 
 def analyze_single_file(
@@ -83,17 +106,32 @@ def analyze_single_file(
     deep: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Analyzes a single PE binary for obfuscation, high entropy, and evasion heuristics."""
-    if not os.path.exists(file_path):
+    norm_path = normalize_windows_path(file_path)
+    if not os.path.exists(norm_path):
         if not quiet:
             console.print(f"[red]Error: File not found -> {file_path}[/red]")
         return None
 
     try:
-        with open(file_path, "rb") as f:
-            file_data = f.read()
-        file_size = len(file_data)
+        file_size = os.path.getsize(norm_path)
+    except Exception as e:
+        if not quiet:
+            console.print(f"[dim]Cannot access {os.path.basename(file_path)}: {e}[/dim]")
+        return None
 
-        # Clean rejection of non-PE formats
+    is_large_file = file_size > 16 * 1024 * 1024
+    file_data = b""
+    pe = None
+
+    try:
+        if not is_large_file:
+            with open(norm_path, "rb") as f:
+                file_data = f.read()
+        else:
+            with open(norm_path, "rb") as f:
+                file_data = f.read(2 * 1024 * 1024)
+
+        # Clean rejection of non-PE formats (e.g. Linux ELF)
         if file_data[:4] == b"\x7fELF":
             if not quiet:
                 console.print(
@@ -102,13 +140,56 @@ def analyze_single_file(
                 )
             return None
 
-        pe = pefile.PE(data=file_data)
+        if is_large_file:
+            pe = pefile.PE(name=norm_path, fast_load=True)
+            pe.parse_data_directories()
+        else:
+            pe = pefile.PE(data=file_data)
     except Exception:
+        # Check if the file starts with MZ but has corrupted or fuzzed headers
+        if file_data[:2] == b"MZ":
+            e_lfanew = 0
+            if len(file_data) >= 64:
+                e_lfanew = struct.unpack("<I", file_data[60:64])[0]
+
+            if e_lfanew < 64:
+                anomalies = ["Legacy 16-bit MS-DOS binary (e_lfanew < 64, no valid PE32 header)."]
+                threat_score = 25
+                verdict_text = "[INFO] Legacy MS-DOS Binary"
+                verdict_color = "dim"
+            else:
+                anomalies = [
+                    f"Header Anomaly: Corrupted DOS e_lfanew pointer ({hex(e_lfanew)}) points past EOF or into malformed headers."
+                ]
+                threat_score = 70
+                verdict_text = "[CRITICAL] High Risk (Corrupted / Malformed PE Headers)"
+                verdict_color = "bold red"
+
+            f_hashes = compute_hashes(file_data) if not is_large_file else compute_file_hashes(norm_path)
+            diagnostic = TriageDiagnostic(
+                filename=os.path.basename(file_path),
+                path=file_path,
+                hashes=f_hashes,
+                imphash=None,
+                threat_score=threat_score,
+                verdict=verdict_text,
+                color=verdict_color,
+                is_dotnet=False,
+                is_signed=False,
+                has_overlay=False,
+                overlay_size=0,
+                total_imports=0,
+                anomalies=anomalies,
+                mitre=[("T1027", "Obfuscated Files or Information", "Malformed PE headers to impede static triage")],
+                sections=[],
+            )
+            return diagnostic.to_dict()
+
         if not quiet:
             console.print(f"[dim]Skipping (Invalid PE or locked): {os.path.basename(file_path)}[/dim]")
         return None
 
-    hashes = compute_hashes(file_data)
+    hashes = compute_hashes(file_data) if not is_large_file else compute_file_hashes(norm_path)
     try:
         imphash_val = pe.get_imphash()
     except Exception:
@@ -132,11 +213,14 @@ def analyze_single_file(
     table.add_column("Entropy Strip", justify="left")
     table.add_column("Status", justify="center")
 
+    # Detect physical section layout anomalies (overlapping sections, zero-length, raw size past EOF)
+    overlap_anomalies, overlap_penalty = detect_overlapping_sections(pe, file_size)
+    if overlap_anomalies:
+        anomalies.extend(overlap_anomalies)
+        threat_score += overlap_penalty
+
     for section in pe.sections:
-        try:
-            name = section.Name.decode("utf-8").rstrip("\x00").lower()
-        except UnicodeDecodeError:
-            name = str(section.Name)
+        name = sanitize_section_name(section.Name).lower()
 
         raw_data = section.get_data()
         entropy = calculate_entropy(raw_data)
@@ -284,7 +368,7 @@ def analyze_single_file(
         heatmap_visual = get_entropy_heatmap_string(raw_data)
 
         table.add_row(
-            name,
+            escape(name),
             hex(section.Misc_VirtualSize),
             hex(section.SizeOfRawData),
             entropy_str,
@@ -317,16 +401,51 @@ def analyze_single_file(
         anomalies.append(f"Security Directory Anomaly: {cert_msg}.")
         threat_score += 30
 
-    max_offset, overlay_data = detect_overlay(pe, file_size, file_data)
-    has_overlay = len(overlay_data) > 0
+    # Enumerate TLS callbacks (pre-entrypoint execution stagers)
+    tls_callbacks = inspect_tls_callbacks(pe, file_data)
+    if tls_callbacks:
+        cb_vas = ", ".join([cb["va"] for cb in tls_callbacks[:4]])
+        anomalies.append(
+            f"Pre-entrypoint TLS callbacks detected ({len(tls_callbacks)} registered: {cb_vas}). Potential staging / anti-debug risk."
+        )
+        threat_score += 25
+
+    max_offset, overlay_data = detect_overlay(pe, file_size, file_data=file_data, file_path=norm_path)
+    has_overlay = file_size > max_offset and max_offset > 0
+    overlay_size = file_size - max_offset if has_overlay else 0
     overlay_entropy = 0.0
     is_cert_overlay = False
+    polyglot_type = None
 
     if has_overlay:
         overlay_entropy = calculate_entropy(overlay_data)
 
         status = "[green]OK[/green]"
         status_clean = "OK"
+
+        # Check for Polyglot container archives in overlay (ZIP, 7z, RAR, PDF)
+        if len(overlay_data) >= 4:
+            if (
+                overlay_data.startswith(b"PK\x03\x04")
+                or overlay_data.startswith(b"PK\x05\x06")
+                or b"PK\x03\x04" in overlay_data[:1024]
+            ):
+                polyglot_type = "ZIP / JAR Archive"
+            elif overlay_data.startswith(b"7z\xbc\xaf\x27\x1c"):
+                polyglot_type = "7-Zip Archive"
+            elif overlay_data.startswith(b"Rar!\x1a\x07"):
+                polyglot_type = "RAR Archive"
+            elif overlay_data.startswith(b"%PDF-"):
+                polyglot_type = "PDF Document"
+
+        if polyglot_type:
+            anomalies.append(
+                f"Polyglot Container: Embedded {polyglot_type} detected in overlay. Steganography / dropper evasion risk (T1027.009)."
+            )
+            threat_score += 45
+            status = "[bold red]POLYGLOT[/bold red]"
+            status_clean = "POLYGLOT"
+            high_entropy_sections.append(("overlay_polyglot", overlay_data, 7.5))
 
         # Validate whether overlay is strictly the Authenticode certificate table
         if is_signed and hasattr(pe, "OPTIONAL_HEADER") and len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 4:
@@ -505,6 +624,35 @@ def analyze_single_file(
         indicators.extend(harvest_indicators(s_bytes))
     indicators = list(set(indicators))
 
+    # Standard UPX Calibration
+    has_upx0 = any(s["name"] == "upx0" for s in sections_telemetry)
+    has_upx1 = any(s["name"] == "upx1" for s in sections_telemetry)
+    has_upx_sig = (
+        b"UPX!" in file_data
+        or (has_overlay and b"UPX!" in overlay_data)
+        or any(b"UPX!" in s[1] for s in high_entropy_sections)
+    )
+
+    if has_upx0 and has_upx1 and has_upx_sig:
+        has_non_upx_wx = any(
+            (section.Characteristics & 0x20000000) and (section.Characteristics & 0x80000000)
+            for section in pe.sections
+            if sanitize_section_name(section.Name).lower() not in ("upx0", "upx1", "upx2")
+        )
+        has_hostile = (
+            has_non_upx_wx
+            or has_staging
+            or is_diluted
+            or (polyglot_type is not None)
+            or any(api in ("VirtualAllocEx", "WriteProcessMemory", "CreateRemoteThread") for api in flagged_apis)
+        )
+        if not has_hostile:
+            threat_score = min(threat_score, 45)
+            anomalies.append(
+                "Packer Calibration: Standard UPX compression format verified (UPX! marker). "
+                "Threat score calibrated to 45 (benign packed utility baseline)."
+            )
+
     threat_score = min(100, threat_score)
 
     if threat_score >= 70:
@@ -545,18 +693,27 @@ def analyze_single_file(
             hashes=hashes,
             imphash_val=imphash_val,
             deep=deep,
+            tls_callbacks=tls_callbacks,
         )
 
     if dump_payloads and high_entropy_sections:
         out_dir = "extracted_payloads"
         os.makedirs(out_dir, exist_ok=True)
-        for s_name, data, ent in high_entropy_sections:
+        sha_pfx = hashes.get("sha256", "00000000")[:8]
+        clean_base = "".join([c if c.isalnum() or c == "." else "_" for c in os.path.basename(file_path)])
+        for idx, (s_name, data, ent) in enumerate(high_entropy_sections):
             clean_name = "".join([c if c.isalnum() else "_" for c in s_name])
-            out_path = os.path.join(out_dir, f"{os.path.basename(file_path)}_{clean_name}.bin")
+            out_path = os.path.join(out_dir, f"{sha_pfx}_{clean_base}_sec{idx}_{clean_name}.bin")
             with open(out_path, "wb") as f:
                 f.write(data)
             if not quiet:
                 console.print(f"[green][+] Carved payload ({len(data)} bytes) -> {out_path}[/green]")
+
+    if is_large_file and pe and hasattr(pe, "close"):
+        try:
+            pe.close()
+        except Exception:
+            pass
 
     diagnostic = TriageDiagnostic(
         filename=os.path.basename(file_path),
@@ -606,8 +763,8 @@ def scan_directory(
     deep: bool = False,
 ) -> List[Dict[str, Any]]:
     """Walks directory, ranks found binaries on incident triage leaderboard, and exports HTML/JSON reports."""
-    dir_path = os.path.abspath(os.path.normpath(dir_path.strip().strip('"\'')))
-    if not os.path.isdir(dir_path):
+    norm_dir = normalize_windows_path(dir_path)
+    if not os.path.isdir(norm_dir):
         console.print(f"[red]Error: Directory not found -> {dir_path}[/red]")
         return []
 
@@ -617,20 +774,54 @@ def scan_directory(
     target_extensions = {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx", ".efi", ".bin"}
 
     if recursive:
-        for root, _, files in os.walk(dir_path):
+        visited_dirs = set()
+        for root, dirs, files in os.walk(norm_dir, followlinks=False):
+            try:
+                real_root = os.path.realpath(root)
+            except Exception:
+                real_root = root
+
+            if real_root in visited_dirs:
+                dirs.clear()
+                continue
+            visited_dirs.add(real_root)
+
+            # Prevent traversing circular junction loops or reparse points
+            pruned_dirs = []
+            for d in dirs:
+                sub_path = os.path.join(root, d)
+                try:
+                    real_sub = os.path.realpath(sub_path)
+                    if real_sub in visited_dirs or (sys.platform == "win32" and os.path.islink(sub_path)):
+                        continue
+                    pruned_dirs.append(d)
+                except Exception:
+                    pass
+            dirs[:] = pruned_dirs
+
             for file in files:
                 if any(file.lower().endswith(ext) for ext in target_extensions):
                     full_p = os.path.join(root, file)
+                    try:
+                        res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
+                        if res:
+                            results.append(res)
+                    except PermissionError:
+                        console.print(f"[dim]Permission denied: {os.path.basename(full_p)}[/dim]")
+                    except Exception as e:
+                        console.print(f"[dim]Skipping {os.path.basename(full_p)}: {e}[/dim]")
+    else:
+        for item in os.listdir(norm_dir):
+            full_p = os.path.join(norm_dir, item)
+            try:
+                if os.path.isfile(full_p) and any(item.lower().endswith(ext) for ext in target_extensions):
                     res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
                     if res:
                         results.append(res)
-    else:
-        for item in os.listdir(dir_path):
-            full_p = os.path.join(dir_path, item)
-            if os.path.isfile(full_p) and any(item.lower().endswith(ext) for ext in target_extensions):
-                res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
-                if res:
-                    results.append(res)
+            except PermissionError:
+                console.print(f"[dim]Permission denied: {os.path.basename(full_p)}[/dim]")
+            except Exception as e:
+                console.print(f"[dim]Skipping {os.path.basename(full_p)}: {e}[/dim]")
 
     if not results:
         console.print("[dim]No Windows PE binaries found in directory.[/dim]")

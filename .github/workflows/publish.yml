@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to attach assets to (e.g. v1.2.2)"
+        description: "Release tag to attach assets to (e.g. v1.2.3)"
         required: false
-        default: "v1.2.2"
+        default: "v1.2.3"
 
 permissions:
   contents: write
