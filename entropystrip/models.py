@@ -37,6 +37,12 @@ class TriageDiagnostic:
     indicators: List[str] = field(default_factory=list)
     sections: List[Dict[str, Any]] = field(default_factory=list)
     wx: bool = False
+    yara_matches: List[Dict[str, Any]] = field(default_factory=list)
+    bazaar_intel: Optional[Dict[str, Any]] = None
+    fuzzy_hash: Optional[str] = None
+    exports_info: Optional[Dict[str, Any]] = None
+    resources_info: List[Dict[str, Any]] = field(default_factory=list)
+    cluster_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -44,6 +50,7 @@ class TriageDiagnostic:
             "path": self.path,
             "hashes": self.hashes,
             "imphash": self.imphash,
+            "fuzzy_hash": self.fuzzy_hash,
             "threat_score": self.threat_score,
             "verdict": self.verdict,
             "color": self.color,
@@ -58,4 +65,9 @@ class TriageDiagnostic:
             "indicators": self.indicators,
             "sections": self.sections,
             "wx": self.wx,
+            "yara_matches": self.yara_matches,
+            "bazaar_intel": self.bazaar_intel,
+            "exports_info": self.exports_info,
+            "resources_info": self.resources_info,
+            "cluster_id": self.cluster_id,
         }

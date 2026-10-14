@@ -16,6 +16,7 @@ except ImportError:
     HAS_CAPSTONE = False
 
 from .radar.staging import STRING_STAGING_APIS
+from .radar.entropy import calculate_entropy
 
 SUSPICIOUS_APIS = {
     "VirtualAlloc", "VirtualProtect", "WriteProcessMemory", 
@@ -491,4 +492,256 @@ def map_mitre_techniques(
             )
             break
 
+    for a in anomalies:
+        if "side-loading" in a.lower() or "proxying" in a.lower():
+            mitre_hits.append(
+                (
+                    "T1574.002",
+                    "Hijack Execution Flow (DLL Side-Loading / Proxying)",
+                    "System DLL name masquerade or forwarded exports detected",
+                )
+            )
+            break
+
+    for a in anomalies:
+        if "resource steganography" in a.lower() or "embedded pe" in a.lower():
+            mitre_hits.append(
+                (
+                    "T1027",
+                    "Obfuscated Files or Information",
+                    "Embedded PE executable hidden inside resource (.rsrc)",
+                )
+            )
+            break
+
     return mitre_hits
+
+
+RESOURCE_TYPE_NAMES = {
+    1: "RT_CURSOR",
+    2: "RT_BITMAP",
+    3: "RT_ICON",
+    4: "RT_MENU",
+    5: "RT_DIALOG",
+    6: "RT_STRING",
+    7: "RT_FONTDIR",
+    8: "RT_FONT",
+    9: "RT_ACCELERATOR",
+    10: "RT_RCDATA",
+    11: "RT_MESSAGETABLE",
+    12: "RT_GROUP_CURSOR",
+    14: "RT_GROUP_ICON",
+    16: "RT_VERSION",
+    17: "RT_DLGINCLUDE",
+    19: "RT_PLUGPLAY",
+    20: "RT_VXD",
+    21: "RT_ANICURSOR",
+    22: "RT_ANIICON",
+    23: "RT_HTML",
+    24: "RT_MANIFEST",
+}
+
+
+def inspect_pe_resources(
+    pe: pefile.PE,
+    file_data: bytes,
+) -> Tuple[List[Dict[str, Any]], List[str], int, List[Tuple[str, bytes, float]]]:
+    """
+    Recursively inspects PE resources (.rsrc tree), evaluating sub-resource entropy,
+    detecting embedded PEs (hidden EXEs/DLLs in resources), and flagging suspicious RT_RCDATA payloads.
+    
+    Returns:
+        (resources_telemetry, anomalies, threat_score_penalty, carveable_payloads)
+    """
+    resources_telemetry: List[Dict[str, Any]] = []
+    anomalies: List[str] = []
+    threat_penalty = 0
+    carveable_payloads: List[Tuple[str, bytes, float]] = []
+
+    if not hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+        return resources_telemetry, anomalies, 0, carveable_payloads
+
+    try:
+        for type_entry in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+            type_id = getattr(type_entry, "id", None)
+            type_name = getattr(type_entry, "name", None)
+            if type_name:
+                type_str = str(type_name)
+            elif type_id in RESOURCE_TYPE_NAMES:
+                type_str = RESOURCE_TYPE_NAMES[type_id]
+            else:
+                type_str = f"TYPE_{type_id}"
+
+            if not hasattr(type_entry, "directory") or not type_entry.directory:
+                continue
+
+            for name_entry in type_entry.directory.entries:
+                res_id = getattr(name_entry, "id", None) or getattr(name_entry, "name", "0")
+                res_identifier = f"{type_str}/{res_id}"
+
+                if not hasattr(name_entry, "directory") or not name_entry.directory:
+                    continue
+
+                for lang_entry in name_entry.directory.entries:
+                    data_entry = getattr(lang_entry, "data", None)
+                    if not data_entry or not hasattr(data_entry, "struct"):
+                        continue
+
+                    rva = getattr(data_entry.struct, "OffsetToData", 0)
+                    size = getattr(data_entry.struct, "Size", 0)
+                    if rva == 0 or size == 0:
+                        continue
+
+                    try:
+                        res_bytes = pe.get_data(rva, size)
+                    except Exception:
+                        res_bytes = b""
+
+                    if not res_bytes:
+                        continue
+
+                    ent = calculate_entropy(res_bytes)
+                    is_suspicious = False
+                    status = "OK"
+
+                    # 1. Embedded Executable Detection (Hidden PE inside resource)
+                    is_embedded_pe = False
+                    if len(res_bytes) >= 64 and res_bytes[:2] == b"MZ":
+                        try:
+                            e_lfanew = struct.unpack("<I", res_bytes[60:64])[0]
+                            if 0 < e_lfanew < len(res_bytes) - 4 and res_bytes[e_lfanew : e_lfanew + 4] == b"PE\x00\x00":
+                                is_embedded_pe = True
+                        except Exception:
+                            pass
+
+                    if is_embedded_pe:
+                        anomalies.append(
+                            f"Resource Steganography: Embedded PE executable detected hidden inside resource '{res_identifier}' "
+                            f"({size} bytes, H={ent:.2f})! Dropper / payload evasion risk (T1027)."
+                        )
+                        threat_penalty += 45
+                        is_suspicious = True
+                        status = "EMBEDDED_PE"
+                        carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
+
+                    # 2. High Entropy in RT_RCDATA or Custom/Raw types
+                    elif type_id == 10 or type_str == "RT_RCDATA" or not type_id:
+                        if ent > 7.3 and size >= 512:
+                            anomalies.append(
+                                f"Resource Anomaly: High-entropy encrypted/packed payload in resource '{res_identifier}' "
+                                f"({size} bytes, H={ent:.2f}). Second-stage dropper risk."
+                            )
+                            threat_penalty += 30
+                            is_suspicious = True
+                            status = "HIGH_ENTROPY"
+                            carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
+                        elif ent > 6.6 and size >= 2048:
+                            status = "SUSPICIOUS"
+
+                    # 3. Non-standard high entropy in other non-image resources
+                    elif type_id not in (2, 3, 14, 21, 22) and ent > 7.4 and size >= 2048:
+                        anomalies.append(
+                            f"Resource Anomaly: Unusually high entropy in {type_str} resource '{res_identifier}' (H={ent:.2f}, {size} bytes)."
+                        )
+                        threat_penalty += 20
+                        is_suspicious = True
+                        status = "HIGH_ENTROPY"
+                        carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
+
+                    resources_telemetry.append(
+                        {
+                            "type": type_str,
+                            "type_id": type_id,
+                            "id": str(res_id),
+                            "rva": hex(rva),
+                            "size": size,
+                            "size_hex": hex(size),
+                            "entropy": round(ent, 2),
+                            "status": status,
+                            "is_suspicious": is_suspicious,
+                            "is_embedded_pe": is_embedded_pe,
+                        }
+                    )
+    except Exception:
+        pass
+
+    return resources_telemetry, anomalies, min(threat_penalty, 60), carveable_payloads
+
+
+KNOWN_HIJACKABLE_SYSTEM_DLLS = {
+    "version.dll", "dbghelp.dll", "cryptbase.dll", "userenv.dll",
+    "wtsapi32.dll", "dwmapi.dll", "d3d9.dll", "dxgi.dll", "wininet.dll",
+    "urlmon.dll", "shcore.dll", "uxtheme.dll", "propsys.dll", "netapi32.dll",
+    "dwrite.dll", "msasn1.dll", "cryptsp.dll", "mscms.dll", "amsi.dll",
+    "iphlpapi.dll", "netutils.dll", "srvcli.dll"
+}
+
+
+def inspect_exports(
+    pe: pefile.PE,
+    file_path: str = "",
+) -> Tuple[Optional[Dict[str, Any]], List[str], int]:
+    """
+    Parses PE Export Address Table (EAT), checks for DLL proxying/forwarding,
+    and identifies DLL side-loading candidates and system DLL masquerading.
+    
+    Returns:
+        (exports_info, anomalies, threat_score_penalty)
+    """
+    if not hasattr(pe, "DIRECTORY_ENTRY_EXPORT") or not pe.DIRECTORY_ENTRY_EXPORT:
+        return None, [], 0
+
+    anomalies: List[str] = []
+    threat_penalty = 0
+
+    try:
+        exp = pe.DIRECTORY_ENTRY_EXPORT
+        raw_name = getattr(exp, "name", b"")
+        internal_name = raw_name.decode("utf-8", errors="ignore") if raw_name else None
+        symbols = getattr(exp, "symbols", []) or []
+
+        forwarded_count = sum(1 for s in symbols if getattr(s, "forwarder", None))
+        total_exports = len(symbols)
+
+        exported_function_names = []
+        for s in symbols[:20]:
+            if s.name:
+                exported_function_names.append(s.name.decode("utf-8", errors="ignore"))
+            elif s.ordinal:
+                exported_function_names.append(f"Ordinal_{s.ordinal}")
+
+        # Check for DLL Proxying / Forwarding
+        if forwarded_count > 0:
+            anomalies.append(
+                f"DLL Proxying / Forwarding detected: {forwarded_count}/{total_exports} export(s) forwarded to external DLLs (T1574.002 Hijack Execution Flow)."
+            )
+            threat_penalty += 35
+
+        # Check for DLL Side-Loading / System DLL Masquerading
+        base_name = os.path.basename(file_path).lower() if file_path else ""
+        internal_lower = internal_name.lower() if internal_name else ""
+
+        is_system_dll_name = base_name in KNOWN_HIJACKABLE_SYSTEM_DLLS or internal_lower in KNOWN_HIJACKABLE_SYSTEM_DLLS
+        if is_system_dll_name:
+            # Check if file resides in legitimate System32 directory
+            norm_p = os.path.normpath(os.path.abspath(file_path)).lower() if file_path else ""
+            is_in_system32 = "windows\\system32" in norm_p or "windows\\syswow64" in norm_p
+            if not is_in_system32:
+                matched_dll = base_name if base_name in KNOWN_HIJACKABLE_SYSTEM_DLLS else internal_lower
+                anomalies.append(
+                    f"High Risk: DLL matches known side-loadable Windows system library '{matched_dll}' residing in non-system directory (T1574.002 DLL Side-Loading risk)."
+                )
+                threat_penalty += 40
+
+        exports_info = {
+            "internal_name": internal_name,
+            "total_exports": total_exports,
+            "forwarded_count": forwarded_count,
+            "sample_exports": exported_function_names,
+            "is_system_dll_name": is_system_dll_name,
+        }
+        return exports_info, anomalies, min(threat_penalty, 55)
+
+    except Exception:
+        return None, [], 0
+

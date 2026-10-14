@@ -34,6 +34,11 @@ EntropyStrip addresses these blind spots with sub-section analysis and structura
 * **Sliding-window inspection:** Scans sections and overlays in 1024-byte and 256-byte windows with adaptive stepping to catch concentrated payloads regardless of total section size.
 * **Dilution and Chi-Square checks:** Evaluates modal byte distribution and opcode uniformity to flag padded ciphertext.
 * **Memory staging detection:** Identifies `UuidFromString` and `RtlIpv4StringToAddress` staging primitives and clusters of formatted UUID strings.
+* **YARA signature engine:** Integrates default threat rules (Cobalt Strike beacons, ransomware shadow copy deletion, reflective loaders, shellcode egg hunters) and custom rules via `--yara [PATH]`. Includes a pure-Python fallback scanner for zero-dependency execution.
+* **Deep PE Resource (.rsrc) tree:** Recursively inspects resource entries, flags embedded PE/MZ executables (resource steganography / T1027), and carves encrypted `RT_RCDATA` payloads.
+* **Export table (EAT) & DLL side-loading triage:** Detects DLL proxying/forwarding and flags binaries masquerading as known Windows system DLLs (T1574.002).
+* **MalwareBazaar threat intelligence:** Opt-in hash reputation lookup via `--bazaar` to classify malware families, community tags, and VirusTotal detection rates without leaking forensic telemetry by default.
+* **Pure-Python fuzzy hashing (SSDEEP/CTPH) & campaign clustering:** Computes rolling piecewise hashes with zero C-dependencies and groups related binaries into automated campaign clusters during directory triage.
 * **Memory permissions:** Flags self-modifying code in sections marked both Writable and Executable (W+X).
 * **Authenticode and installer verification:** Validates PE `WIN_CERTIFICATE` directory bounds and NSIS `0xdeadbeef` headers so signed software and installers are not falsely scored.
 * **Rich Header inspection:** Detects stripped or invalid MSVC Rich Headers in native binaries.
@@ -63,28 +68,42 @@ pip install -e .
 ## Usage
 
 ```text
-usage: entropystrip [-h] [-r] [--dump] [--deep] [--html HTML] [--json JSON] target
+usage: entropystrip [-h] [-v] [-r] [--dump] [--deep] [-i] [--install]
+                    [--uninstall] [--html HTML] [--json JSON]
+                    [--yara [RULE_PATH]] [--bazaar] [--bazaar-key KEY]
+                    [target]
 
-EntropyStrip: PE De-obfuscator & Triage Engine
+EntropyStrip: PE De-obfuscator, Shannon Entropy Radar, and Incident Triage Engine
 
 positional arguments:
-  target         Path to Windows executable (.exe / .dll) or directory to scan
+  target              Path to Windows executable (.exe / .dll) or directory
 
 options:
-  -h, --help     show this help message and exit
-  -r, --recursive
-                 recursively scan subdirectories if target is a folder
-  --dump         carve and write high-entropy payloads to extracted_payloads/
-  --deep         deep forensic triage: MITRE ATT&CK mapping, entry point disassembly, hashes
-  --html HTML    write standalone HTML report to specified path
-  --json JSON    write machine-readable JSON telemetry to specified path
+  -h, --help          show this help message and exit
+  -v, --version       Show program's version number and exit
+  -r, --recursive     Recursively scan subdirectories
+  --dump              Carve high-entropy payloads to extracted_payloads/
+  --deep              Deep forensic triage: MITRE ATT&CK mapping, entry point disassembly, hashes
+  -i, --interactive   Launch interactive triage wizard
+  --install           Install EntropyStrip globally to Windows PATH
+  --uninstall         Uninstall EntropyStrip from Windows PATH
+  --html HTML         Path to write standalone HTML report
+  --json JSON         Path to write machine-readable JSON telemetry
+  --yara [RULE_PATH]  Scan with YARA rules (uses bundled threats.yar by default, or custom file/dir)
+  --bazaar            Query MalwareBazaar (abuse.ch) for sample hash intelligence and signatures
+  --bazaar-key KEY    MalwareBazaar API Auth-Key (overrides MALWAREBAZAAR_API_KEY environment variable)
 ```
 
 ### Examples
 
-**Analyze a single binary:**
+**Analyze a single binary with YARA scanning:**
 ```bash
-entropystrip target.exe
+entropystrip target.exe --yara
+```
+
+**Scan with custom YARA rules and query MalwareBazaar threat intel:**
+```bash
+entropystrip suspicious.exe --yara my_rules.yar --bazaar
 ```
 
 **Deep forensic triage with MITRE ATT&CK mapping & disassembly:**
@@ -92,20 +111,20 @@ entropystrip target.exe
 entropystrip suspicious.exe --deep
 ```
 
-**Extract hidden payload buffers:**
+**Extract hidden payload buffers and embedded resources:**
 ```bash
 entropystrip suspicious.exe --dump
 ```
-Carved payloads are written to `extracted_payloads/<target>_<section>.bin`.
+Carved payloads are written to `extracted_payloads/<sha>_<target>_<section>.bin`.
 
 **Export a standalone HTML report:**
 ```bash
 entropystrip sample.exe --html report.html
 ```
 
-**Triage an entire directory of files:**
+**Triage an entire directory with automated campaign clustering:**
 ```bash
-entropystrip "C:\IncidentTriage" -r
+entropystrip "C:\IncidentTriage" -r --html incident_report.html
 ```
 
 ---

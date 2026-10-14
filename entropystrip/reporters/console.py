@@ -27,6 +27,11 @@ def render_console_report(
     imphash_val: Optional[str] = None,
     deep: bool = False,
     tls_callbacks: Optional[List[Dict[str, Any]]] = None,
+    fuzzy_hash: Optional[str] = None,
+    bazaar_intel: Optional[Dict[str, Any]] = None,
+    yara_matches: Optional[List[Dict[str, Any]]] = None,
+    resources_info: Optional[List[Dict[str, Any]]] = None,
+    exports_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Renders comprehensive CLI triage dashboard."""
     console.print(f"\n[bold]Target:[/bold] {escape(target_path)}")
@@ -34,6 +39,8 @@ def render_console_report(
         console.print(f"[dim]SHA256: {hashes.get('sha256', '-')}[/dim]")
         if imphash_val:
             console.print(f"[dim]Imphash: {imphash_val}[/dim]")
+        if fuzzy_hash:
+            console.print(f"[dim]SSDEEP:  {fuzzy_hash}[/dim]")
 
     console.print(sections_table)
 
@@ -51,6 +58,74 @@ def render_console_report(
         )
 
     console.print("\n", Panel(score_panel_text, title="Triage Diagnostic", border_style=verdict_color))
+
+    # MalwareBazaar Threat Intel Panel
+    if bazaar_intel:
+        if bazaar_intel.get("status") == "malicious":
+            bazaar_text = (
+                f"[bold red]Malware Signature:[/bold red] {escape(str(bazaar_intel.get('signature', 'Unknown Threat')))}\n"
+                f"[bold]Tags:[/bold] {escape(', '.join(bazaar_intel.get('tags', [])))}\n"
+                f"[bold]First Seen:[/bold] {escape(str(bazaar_intel.get('first_seen', '-')))} | "
+                f"[bold]Reporter:[/bold] @{escape(str(bazaar_intel.get('reporter', '-')))}"
+            )
+            vt = bazaar_intel.get("virustotal")
+            if vt and vt.get("percent") is not None:
+                bazaar_text += f"\n[bold]VirusTotal Detection:[/bold] [bold red]{vt['percent']:.1f}%[/bold red] ({vt.get('positives')}/{vt.get('total')})"
+            console.print(Panel(bazaar_text, title="MalwareBazaar Threat Intelligence (abuse.ch)", border_style="bold red"))
+        elif bazaar_intel.get("status") == "not_found":
+            console.print(Panel("[dim]Hash not found in MalwareBazaar dataset (0 community reports).[/dim]", title="MalwareBazaar Threat Intelligence", border_style="dim"))
+
+    # YARA Rules Matches Table
+    if yara_matches:
+        yara_table = Table(title="YARA Rule Detections", show_header=True, header_style="bold red")
+        yara_table.add_column("Rule", style="bold red")
+        yara_table.add_column("Severity", justify="center")
+        yara_table.add_column("Description", style="dim")
+        yara_table.add_column("MITRE", style="cyan", justify="center")
+        for y in yara_matches:
+            yara_table.add_row(
+                escape(str(y.get("rule", ""))),
+                escape(str(y.get("severity", "medium")).upper()),
+                escape(str(y.get("description", ""))),
+                escape(str(y.get("mitre") or "-")),
+            )
+        console.print(yara_table)
+
+    # Resource Tree Breakdown (.rsrc)
+    if resources_info:
+        rsrc_rows = [res for res in resources_info if deep or res.get("is_suspicious") or res.get("entropy", 0) > 6.5]
+        if rsrc_rows:
+            rsrc_table = Table(title="PE Resource Tree (.rsrc Diagnostics)", show_header=True, header_style="bold cyan")
+            rsrc_table.add_column("Type", style="bold")
+            rsrc_table.add_column("Resource ID", style="dim")
+            rsrc_table.add_column("Size", justify="right")
+            rsrc_table.add_column("Entropy", justify="right")
+            rsrc_table.add_column("Status", justify="center")
+            for res in rsrc_rows:
+                st_style = "bold red" if res.get("is_suspicious") else ("yellow" if res.get("status") == "SUSPICIOUS" else "green")
+                rsrc_table.add_row(
+                    escape(str(res.get("type", ""))),
+                    escape(str(res.get("id", ""))),
+                    escape(str(res.get("size_hex", ""))),
+                    f"{res.get('entropy', 0.0):.2f}",
+                    f"[{st_style}]{escape(str(res.get('status', 'OK')))}[/{st_style}]",
+                )
+            console.print(rsrc_table)
+
+    # Export Address Table & Side-Loading
+    if exports_info:
+        fwd = exports_info.get("forwarded_count", 0)
+        tot = exports_info.get("total_exports", 0)
+        sys_match = exports_info.get("is_system_dll_name", False)
+        exp_border = "bold red" if (fwd > 0 or sys_match) else "dim"
+        exp_text = (
+            f"[bold]DLL Internal Name:[/bold] {escape(str(exports_info.get('internal_name') or 'None'))}\n"
+            f"[bold]Total Exports:[/bold] {tot} | [bold]Forwarded Proxy Exports:[/bold] [{'bold red' if fwd else 'dim'}]{fwd}[/{'bold red' if fwd else 'dim'}]\n"
+            f"[bold]Side-Loading Risk:[/bold] [{'bold red' if sys_match else 'green'}]{'HIGH (System DLL Name Match)' if sys_match else 'Low / Standard'}[/{'bold red' if sys_match else 'green'}]"
+        )
+        if exports_info.get("sample_exports"):
+            exp_text += f"\n[dim]Exported APIs: {escape(', '.join(exports_info['sample_exports'][:10]))}[/dim]"
+        console.print(Panel(exp_text, title="Export Address Table (EAT) & DLL Hijacking Triage", border_style=exp_border))
 
     if deep:
         if tls_callbacks:
@@ -89,8 +164,11 @@ def render_console_report(
             console.print("\n", Panel(escape(ep_disasm), title="Entry Point Disassembly Stub", border_style="dim"))
 
 
-def render_triage_leaderboard(results: List[Dict[str, Any]]) -> None:
-    """Renders directory triage leaderboard ranked by threat score."""
+def render_triage_leaderboard(
+    results: List[Dict[str, Any]],
+    clusters: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> None:
+    """Renders directory triage leaderboard ranked by threat score with campaign clusters."""
     triage_table = Table(
         title="Incident Triage Leaderboard (Ranked by Threat Score)",
         show_header=True,
@@ -108,10 +186,10 @@ def render_triage_leaderboard(results: List[Dict[str, Any]]) -> None:
     for idx, r in enumerate(results, 1):
         score_str = f"[{r['color']}]{r['threat_score']}[/{r['color']}]"
         verdict_str = f"[{r['color']}]{escape(r['verdict'])}[/{r['color']}]"
-        wx_str = "[bold red]YES[/bold red]" if r["wx"] else "[dim]NO[/dim]"
-        dotnet_str = "[cyan]YES[/cyan]" if r["is_dotnet"] else "[dim]NO[/dim]"
-        overlay_str = "[bold red]YES[/bold red]" if r["has_overlay"] else "[dim]NO[/dim]"
-        top_anomaly = escape(r["anomalies"][0]) if r["anomalies"] else "None"
+        wx_str = "[bold red]YES[/bold red]" if r.get("wx") else "[dim]NO[/dim]"
+        dotnet_str = "[cyan]YES[/cyan]" if r.get("is_dotnet") else "[dim]NO[/dim]"
+        overlay_str = "[bold red]YES[/bold red]" if r.get("has_overlay") else "[dim]NO[/dim]"
+        top_anomaly = escape(r["anomalies"][0]) if r.get("anomalies") else "None"
 
         triage_table.add_row(
             str(idx),
@@ -125,4 +203,11 @@ def render_triage_leaderboard(results: List[Dict[str, Any]]) -> None:
         )
 
     console.print(triage_table)
+
+    if clusters:
+        console.print("\n[bold cyan]Automated Campaign Clusters (Fuzzy Hash Similarity >= 70%):[/bold cyan]")
+        for c_name, members in clusters.items():
+            names = ", ".join([escape(m["filename"]) for m in members])
+            console.print(f"  • [bold magenta]{c_name}[/bold magenta] ({len(members)} binaries): [dim]{names}[/dim]")
+
     console.print(f"\n[green][+] Completed:[/green] Triaged {len(results)} binaries.")

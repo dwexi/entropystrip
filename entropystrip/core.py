@@ -44,7 +44,12 @@ from .scanner import (
     sanitize_section_name,
     detect_overlapping_sections,
     inspect_tls_callbacks,
+    inspect_pe_resources,
+    inspect_exports,
 )
+from .rules import scan_yara
+from .intel import query_malware_bazaar
+from .radar.fuzzy import compute_fuzzy_hash, cluster_samples
 from .reporters.console import (
     console,
     render_console_report,
@@ -78,6 +83,12 @@ __all__ = [
     "sanitize_section_name",
     "detect_overlapping_sections",
     "inspect_tls_callbacks",
+    "inspect_pe_resources",
+    "inspect_exports",
+    "scan_yara",
+    "query_malware_bazaar",
+    "compute_fuzzy_hash",
+    "cluster_samples",
     "generate_html_report",
     "generate_directory_html_report",
 ]
@@ -104,6 +115,10 @@ def analyze_single_file(
     html_out: Optional[str] = None,
     json_out: Optional[str] = None,
     deep: bool = False,
+    yara_rule_path: Optional[str] = None,
+    enable_yara: bool = False,
+    enable_bazaar: bool = False,
+    bazaar_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Analyzes a single PE binary for obfuscation, high entropy, and evasion heuristics."""
     norm_path = normalize_windows_path(file_path)
@@ -166,11 +181,13 @@ def analyze_single_file(
                 verdict_color = "bold red"
 
             f_hashes = compute_hashes(file_data) if not is_large_file else compute_file_hashes(norm_path)
+            f_fuzzy = compute_fuzzy_hash(file_data) if file_data else None
             diagnostic = TriageDiagnostic(
                 filename=os.path.basename(file_path),
                 path=file_path,
                 hashes=f_hashes,
                 imphash=None,
+                fuzzy_hash=f_fuzzy,
                 threat_score=threat_score,
                 verdict=verdict_text,
                 color=verdict_color,
@@ -190,6 +207,7 @@ def analyze_single_file(
         return None
 
     hashes = compute_hashes(file_data) if not is_large_file else compute_file_hashes(norm_path)
+    fuzzy_hash = compute_fuzzy_hash(file_data) if file_data else None
     try:
         imphash_val = pe.get_imphash()
     except Exception:
@@ -595,6 +613,45 @@ def analyze_single_file(
         anomalies.append(f"String-based shellcode staging primitive detected ({'; '.join(parts)}).")
         threat_score += 35
 
+    # PE Resource Tree Inspection (.rsrc deep traversal & embedded PE / RC_DATA detection)
+    rsrc_telemetry, rsrc_anomalies, rsrc_penalty, rsrc_carveables = inspect_pe_resources(pe, file_data)
+    if rsrc_anomalies:
+        anomalies.extend(rsrc_anomalies)
+        threat_score += rsrc_penalty
+    if rsrc_carveables:
+        high_entropy_sections.extend(rsrc_carveables)
+
+    # Export Address Table (EAT) Inspection & DLL Side-Loading / Masquerading
+    exp_info, exp_anomalies, exp_penalty = inspect_exports(pe, norm_path)
+    if exp_anomalies:
+        anomalies.extend(exp_anomalies)
+        threat_score += exp_penalty
+
+    # YARA Rules Engine Scanning (Bundled threats.yar or custom user rule)
+    yara_matches: List[Dict[str, Any]] = []
+    if enable_yara or yara_rule_path is not None:
+        custom_rule = None if yara_rule_path in (None, "__default__") else yara_rule_path
+        yara_matches = scan_yara(file_data, custom_path=custom_rule, file_path=norm_path)
+        for ym in yara_matches:
+            rule_nm = ym.get("rule", "UnknownRule")
+            rule_desc = ym.get("description", "")
+            rule_score = ym.get("threat_score", 35)
+            anomalies.append(f"YARA Detection: [{rule_nm}] - {rule_desc}" if rule_desc else f"YARA Detection: [{rule_nm}]")
+            threat_score += rule_score
+
+    # MalwareBazaar Threat Intelligence API Query (Opt-in via --bazaar)
+    bazaar_intel: Optional[Dict[str, Any]] = None
+    if enable_bazaar:
+        sha256_hash = hashes.get("sha256", "")
+        if sha256_hash:
+            bazaar_intel = query_malware_bazaar(sha256_hash, api_key=bazaar_key)
+            if bazaar_intel and bazaar_intel.get("status") == "malicious":
+                fam = bazaar_intel.get("signature") or "Known Threat"
+                tg = ", ".join(bazaar_intel.get("tags", []))
+                tg_str = f" (Tags: {tg})" if tg else ""
+                anomalies.append(f"MalwareBazaar Threat Intelligence: Confirmed malicious sample! Family: '{fam}'{tg_str}")
+                threat_score += 45
+
     # Installer and Authenticode whitelisting
     exec_high_entropy = any(
         s.get("perms") in ("R+X", "W+X") and s.get("entropy", 0) > 7.0 for s in sections_telemetry
@@ -694,6 +751,11 @@ def analyze_single_file(
             imphash_val=imphash_val,
             deep=deep,
             tls_callbacks=tls_callbacks,
+            fuzzy_hash=fuzzy_hash,
+            bazaar_intel=bazaar_intel,
+            yara_matches=yara_matches,
+            resources_info=rsrc_telemetry,
+            exports_info=exp_info,
         )
 
     if dump_payloads and high_entropy_sections:
@@ -734,6 +796,11 @@ def analyze_single_file(
         indicators=indicators,
         sections=sections_telemetry,
         wx=has_wx,
+        yara_matches=yara_matches,
+        bazaar_intel=bazaar_intel,
+        fuzzy_hash=fuzzy_hash,
+        exports_info=exp_info,
+        resources_info=rsrc_telemetry,
     )
     telemetry_data = diagnostic.to_dict()
 
@@ -761,6 +828,10 @@ def scan_directory(
     html_out: Optional[str] = None,
     json_out: Optional[str] = None,
     deep: bool = False,
+    yara_rule_path: Optional[str] = None,
+    enable_yara: bool = False,
+    enable_bazaar: bool = False,
+    bazaar_key: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Walks directory, ranks found binaries on incident triage leaderboard, and exports HTML/JSON reports."""
     norm_dir = normalize_windows_path(dir_path)
@@ -803,7 +874,16 @@ def scan_directory(
                 if any(file.lower().endswith(ext) for ext in target_extensions):
                     full_p = os.path.join(root, file)
                     try:
-                        res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
+                        res = analyze_single_file(
+                            full_p,
+                            dump_payloads=dump_payloads,
+                            quiet=True,
+                            deep=deep,
+                            yara_rule_path=yara_rule_path,
+                            enable_yara=enable_yara,
+                            enable_bazaar=enable_bazaar,
+                            bazaar_key=bazaar_key,
+                        )
                         if res:
                             results.append(res)
                     except PermissionError:
@@ -815,7 +895,16 @@ def scan_directory(
             full_p = os.path.join(norm_dir, item)
             try:
                 if os.path.isfile(full_p) and any(item.lower().endswith(ext) for ext in target_extensions):
-                    res = analyze_single_file(full_p, dump_payloads=dump_payloads, quiet=True, deep=deep)
+                    res = analyze_single_file(
+                        full_p,
+                        dump_payloads=dump_payloads,
+                        quiet=True,
+                        deep=deep,
+                        yara_rule_path=yara_rule_path,
+                        enable_yara=enable_yara,
+                        enable_bazaar=enable_bazaar,
+                        bazaar_key=bazaar_key,
+                    )
                     if res:
                         results.append(res)
             except PermissionError:
@@ -827,8 +916,11 @@ def scan_directory(
         console.print("[dim]No Windows PE binaries found in directory.[/dim]")
         return []
 
+    # Run Automated Fuzzy Hash Campaign Clustering
+    clusters = cluster_samples(results, similarity_threshold=70)
+
     results.sort(key=lambda x: x["threat_score"], reverse=True)
-    render_triage_leaderboard(results)
+    render_triage_leaderboard(results, clusters=clusters)
 
     if json_out:
         out_dir = os.path.dirname(os.path.abspath(json_out))
@@ -839,10 +931,15 @@ def scan_directory(
             "suspicious": sum(1 for r in results if 35 <= r.get("threat_score", 0) < 70),
             "clean": sum(1 for r in results if r.get("threat_score", 0) < 35),
         }
+        clusters_export = {
+            c_name: [m.get("filename") for m in members]
+            for c_name, members in clusters.items()
+        }
         directory_telemetry = {
             "target_directory": dir_path,
             "total_scanned": len(results),
             "summary": summary,
+            "campaign_clusters": clusters_export,
             "results": results,
         }
         with open(json_out, "w", encoding="utf-8") as f:

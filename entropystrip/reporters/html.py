@@ -54,6 +54,7 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
     hashes = telemetry.get("hashes") or {}
     sha256_val = hashes.get("sha256", "-")
     imphash_val = telemetry.get("imphash") or "-"
+    fuzzy_val = telemetry.get("fuzzy_hash") or "-"
 
     sections_html = ""
     for s in telemetry.get("sections", []):
@@ -103,6 +104,96 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
                 f"<td style='font-weight:600;'>{html.escape(str(tname))}</td>"
                 f"<td>{html.escape(str(tdesc))}</td></tr>"
             )
+
+    bazaar_html = ""
+    bazaar = telemetry.get("bazaar_intel")
+    if bazaar and bazaar.get("status") == "malicious":
+        vt = bazaar.get("virustotal") or {}
+        vt_str = f"{vt.get('percent', 0.0):.1f}% ({vt.get('positives', 0)}/{vt.get('total', 0)})" if vt else "N/A"
+        bazaar_html = f"""
+        <div class="findings-card" style="border-left: 3px solid #e06c75; margin-bottom: 20px;">
+            <h3 style="color:#e06c75;">MalwareBazaar Threat Intelligence (abuse.ch)</h3>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:8px;">
+                <div><span style="color:#5c6370; font-size:10px;">SIGNATURE:</span> <b style="color:#e06c75;">{html.escape(str(bazaar.get('signature', 'Unknown Threat')))}</b></div>
+                <div><span style="color:#5c6370; font-size:10px;">TAGS:</span> <span>{html.escape(', '.join(bazaar.get('tags', [])))}</span></div>
+                <div><span style="color:#5c6370; font-size:10px;">FIRST SEEN:</span> <span>{html.escape(str(bazaar.get('first_seen', '-')))}</span></div>
+                <div><span style="color:#5c6370; font-size:10px;">VIRUSTOTAL:</span> <span style="color:#e06c75; font-weight:600;">{html.escape(vt_str)}</span></div>
+            </div>
+        </div>
+        """
+
+    yara_html = ""
+    yara_hits = telemetry.get("yara_matches", [])
+    if yara_hits:
+        y_rows = "".join([
+            f"<tr><td style='color:#e06c75; font-weight:600;'>{html.escape(str(y.get('rule', y) if isinstance(y, dict) else str(y)))}</td>"
+            f"<td style='text-align:center;'><span class='badge' style='color:#e06c75;'>{html.escape(str(y.get('severity', 'HIGH')).upper() if isinstance(y, dict) else 'DETECTED')}</span></td>"
+            f"<td>{html.escape(str(y.get('description', '')) if isinstance(y, dict) else '')}</td></tr>"
+            for y in yara_hits
+        ])
+        yara_html = f"""
+        <div style="font-weight: 600; margin-bottom: 8px; color: #e6edf3; font-size: 12px; text-transform: uppercase;">YARA Rule Detections</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Rule Name</th>
+                    <th style="text-align:center;">Severity</th>
+                    <th>Description</th>
+                </tr>
+            </thead>
+            <tbody>
+                {y_rows}
+            </tbody>
+        </table>
+        """
+
+    resources_html = ""
+    rsrcs = [r for r in telemetry.get("resources_info", []) if r.get("is_suspicious") or r.get("entropy", 0) > 6.5]
+    if rsrcs:
+        r_rows = "".join([
+            f"<tr><td style='font-weight:600;'>{html.escape(str(r.get('type', '')))}</td>"
+            f"<td style='font-family:monospace;'>{html.escape(str(r.get('id', '')))}</td>"
+            f"<td style='text-align:right; font-family:monospace;'>{html.escape(str(r.get('size_hex', '')))}</td>"
+            f"<td style='text-align:right; font-weight:600;'>{r.get('entropy', 0.0):.2f}</td>"
+            f"<td style='text-align:center;'>{_get_status_badge(r.get('status', 'OK'))}</td></tr>"
+            for r in rsrcs
+        ])
+        resources_html = f"""
+        <div style="font-weight: 600; margin-bottom: 8px; color: #e6edf3; font-size: 12px; text-transform: uppercase;">PE Resource Tree (.rsrc Diagnostics)</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>ID / Name</th>
+                    <th style="text-align:right;">Size</th>
+                    <th style="text-align:right;">Entropy</th>
+                    <th style="text-align:center;">Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {r_rows}
+            </tbody>
+        </table>
+        """
+
+    exports_html = ""
+    exp = telemetry.get("exports_info")
+    if exp:
+        fwd = exp.get("forwarded_count", 0)
+        tot = exp.get("total_exports", 0)
+        sys_match = exp.get("is_system_dll_name", False)
+        status_txt = "HIGH RISK (Known Hijackable System DLL Name)" if sys_match else "Standard DLL"
+        exports_html = f"""
+        <div class="findings-card" style="border-left: 3px solid {'#e06c75' if (fwd or sys_match) else '#282c34'}; margin-bottom: 20px;">
+            <h3>Export Address Table (EAT) & DLL Hijacking Triage</h3>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:8px;">
+                <div><span style="color:#5c6370; font-size:10px;">INTERNAL NAME:</span> <b>{html.escape(str(exp.get('internal_name') or 'None'))}</b></div>
+                <div><span style="color:#5c6370; font-size:10px;">TOTAL EXPORTS:</span> <span>{tot}</span></div>
+                <div><span style="color:#5c6370; font-size:10px;">FORWARDED PROXIES:</span> <b style="color:{'#e06c75' if fwd else '#abb2bf'};">{fwd}</b></div>
+                <div><span style="color:#5c6370; font-size:10px;">SIDE-LOADING RISK:</span> <b style="color:{'#e06c75' if sys_match else '#98c379'};">{html.escape(status_txt)}</b></div>
+            </div>
+        </div>
+        """
 
     report_html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -279,12 +370,12 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
             <div class="meta-val">{html.escape(str(imphash_val))}</div>
         </div>
         <div class="meta-item">
-            <div class="meta-label">Architecture</div>
-            <div class="meta-val">{'Managed (.NET)' if telemetry.get('is_dotnet') else 'Native PE'} | {'Signed' if telemetry.get('is_signed') else 'Unsigned'}</div>
+            <div class="meta-label">SSDEEP (Fuzzy Hash)</div>
+            <div class="meta-val" style="font-size:10px;">{html.escape(str(fuzzy_val))}</div>
         </div>
         <div class="meta-item">
-            <div class="meta-label">Imports</div>
-            <div class="meta-val">{telemetry.get('total_imports', 0)} Functions</div>
+            <div class="meta-label">Architecture</div>
+            <div class="meta-val">{'Managed (.NET)' if telemetry.get('is_dotnet') else 'Native PE'} | {'Signed' if telemetry.get('is_signed') else 'Unsigned'}</div>
         </div>
     </div>
 
@@ -295,6 +386,10 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
             <span class="verdict-tag">{html.escape(str(telemetry.get('verdict', 'Unknown')))}</span>
         </div>
     </div>
+
+    {bazaar_html}
+    {yara_html}
+    {exports_html}
 
     <div style="font-weight: 600; margin-bottom: 8px; color: #e6edf3; font-size: 12px; text-transform: uppercase;">Section Architecture & Entropy Strip</div>
     <table>
@@ -313,6 +408,8 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
             {sections_html}
         </tbody>
     </table>
+
+    {resources_html}
 
     <div class="findings-card">
         <h3>Structural Findings & Anomalies</h3>
@@ -436,6 +533,26 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
             <ul>{anom_list}</ul>
             {indicators_list}
             {mitre_list}
+        </div>
+        """
+
+    clusters_html = ""
+    clustered = {}
+    for r in sorted_results:
+        cid = r.get("cluster_id")
+        if cid:
+            clustered.setdefault(cid, []).append(r)
+
+    if clustered:
+        c_items = "".join([
+            f"<div style='margin-bottom:8px;'><b style='color:#61afef;'>{html.escape(cid)}</b> ({len(members)} binaries): "
+            f"<span style='color:#abb2bf;'>{', '.join([html.escape(m.get('filename', '')) for m in members])}</span></div>"
+            for cid, members in clustered.items()
+        ])
+        clusters_html = f"""
+        <div class="findings-card" style="border-left: 3px solid #61afef; margin-bottom: 24px;">
+            <h4 style="color:#61afef; margin-top:0;">Automated Campaign Clusters (Fuzzy Hash Similarity &ge; 70%)</h4>
+            {c_items}
         </div>
         """
 
@@ -586,6 +703,8 @@ def generate_directory_html_report(results: List[Dict[str, Any]], target_dir: st
             <div class="summary-label">Clean / Low Risk (&lt;35)</div>
         </div>
     </div>
+
+    {clusters_html}
 
     <div style="font-weight: 600; margin-bottom: 8px; color: #e6edf3; font-size: 12px; text-transform: uppercase;">Ranked Binaries</div>
     <table>

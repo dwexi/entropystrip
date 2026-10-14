@@ -152,6 +152,33 @@ def run_interactive_menu() -> None:
     except (KeyboardInterrupt, EOFError):
         pass
 
+    yara = True
+    try:
+        y_ans = input("Enable YARA signature scanning? [Y/n]: ").strip().lower()
+        yara = y_ans not in ("n", "no")
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    bazaar = False
+    bazaar_key = None
+    try:
+        b_ans = input("Enable MalwareBazaar threat intel lookup (--bazaar)? [y/N]: ").strip().lower()
+        bazaar = b_ans in ("y", "yes")
+        if bazaar:
+            key_ans = input("Enter MalwareBazaar Auth-Key (optional, press Enter to use default/saved key): ").strip()
+            if key_ans:
+                bazaar_key = key_ans
+                save_ans = input("Save this API key for future scans? [Y/n]: ").strip().lower()
+                if save_ans not in ("n", "no"):
+                    try:
+                        from .intel.config import set_bazaar_api_key
+                        set_bazaar_api_key(bazaar_key)
+                        console.print("[dim]API key saved to ~/.entropystrip/config.json[/dim]")
+                    except Exception:
+                        pass
+    except (KeyboardInterrupt, EOFError):
+        pass
+
     dump = False
     try:
         dump_ans = input("Carve high-entropy payloads (--dump)? [y/N]: ").strip().lower()
@@ -177,6 +204,9 @@ def run_interactive_menu() -> None:
             dump_payloads=dump,
             html_out=html_out,
             deep=deep,
+            enable_yara=yara,
+            enable_bazaar=bazaar,
+            bazaar_key=bazaar_key,
         )
     else:
         analyze_single_file(
@@ -185,6 +215,9 @@ def run_interactive_menu() -> None:
             quiet=False,
             html_out=html_out,
             deep=deep,
+            enable_yara=yara,
+            enable_bazaar=bazaar,
+            bazaar_key=bazaar_key,
         )
 
     pause_for_user("\nScan complete. Press Enter to exit...")
@@ -222,6 +255,24 @@ def main() -> None:
     parser.add_argument("--uninstall", action="store_true", help="Uninstall EntropyStrip from Windows PATH")
     parser.add_argument("--html", help="Path to write HTML report")
     parser.add_argument("--json", help="Path to write JSON telemetry")
+    parser.add_argument(
+        "--yara",
+        nargs="?",
+        const="__default__",
+        default=None,
+        metavar="RULE_PATH",
+        help="Scan with YARA rules (uses bundled threats.yar by default, or specified .yar file/dir)",
+    )
+    parser.add_argument(
+        "--bazaar",
+        action="store_true",
+        help="Query MalwareBazaar (abuse.ch) for sample hash intelligence and signatures",
+    )
+    parser.add_argument(
+        "--bazaar-key",
+        metavar="KEY",
+        help="MalwareBazaar API Auth-Key (overrides MALWAREBAZAAR_API_KEY environment variable)",
+    )
     args = parser.parse_args()
 
     if args.install:
@@ -256,6 +307,10 @@ def main() -> None:
             html_out=args.html,
             json_out=args.json,
             deep=args.deep,
+            yara_rule_path=args.yara,
+            enable_yara=args.yara is not None,
+            enable_bazaar=args.bazaar,
+            bazaar_key=args.bazaar_key,
         )
     else:
         analyze_single_file(
@@ -265,6 +320,10 @@ def main() -> None:
             html_out=args.html,
             json_out=args.json,
             deep=args.deep,
+            yara_rule_path=args.yara,
+            enable_yara=args.yara is not None,
+            enable_bazaar=args.bazaar,
+            bazaar_key=args.bazaar_key,
         )
 
     if is_explorer_launched():
