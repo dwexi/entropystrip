@@ -35,25 +35,26 @@ ___________       __                               _________ __         .__
 """
 
 
-def should_pause_on_exit() -> bool:
-    """Returns True if running in a console window allocated directly by Windows Explorer."""
+def is_explorer_launched() -> bool:
+    """Returns True if the console window was allocated directly by Windows Explorer."""
     try:
         if sys.platform == "win32" and sys.stdin and sys.stdin.isatty():
-            process_list = (ctypes.c_uint * 2)()
-            count = ctypes.windll.kernel32.GetConsoleProcessList(process_list, 2)
-            return count <= 1
+            process_list = (ctypes.c_uint * 4)()
+            count = ctypes.windll.kernel32.GetConsoleProcessList(process_list, 4)
+            # PyInstaller onefile bootloader + unpacked child = 2 processes in dedicated console
+            threshold = 2 if getattr(sys, "frozen", False) else 1
+            return count <= threshold
     except Exception:
         pass
     return False
 
 
-def pause_if_needed(prompt: str = "\nPress Enter to exit...") -> None:
-    """Pauses execution if the console window would otherwise close immediately."""
-    if should_pause_on_exit():
-        try:
-            input(prompt)
-        except Exception:
-            pass
+def pause_for_user(prompt: str = "\nPress Enter to exit...") -> None:
+    """Pauses execution until the user presses Enter."""
+    try:
+        input(prompt)
+    except Exception:
+        pass
 
 
 class StandaloneArgumentParser(argparse.ArgumentParser):
@@ -62,7 +63,8 @@ class StandaloneArgumentParser(argparse.ArgumentParser):
     def exit(self, status: int = 0, message: str = None) -> None:
         if message:
             self._print_message(message, sys.stderr)
-        pause_if_needed("\nPress Enter to exit...")
+        if is_explorer_launched():
+            pause_for_user("\nPress Enter to exit...")
         sys.exit(status)
 
 
@@ -72,53 +74,35 @@ def main() -> None:
         console.print(BANNER, style="cyan")
         if sys.platform == "win32":
             if not is_installed_globally():
-                console.print("[cyan][*] Setting up EntropyStrip globally on Windows...[/cyan]")
-                install_globally()
+                console.print("[bold yellow]EntropyStrip is not yet registered in your Windows PATH.[/bold yellow]\n")
+                try:
+                    choice = input("Do you want to install EntropyStrip to your Windows PATH? [Y/n]: ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    choice = "n"
+
+                if choice in ("", "y", "yes"):
+                    install_globally()
+                else:
+                    console.print("[dim]Installation skipped.[/dim]\n")
             else:
                 console.print(
-                    f"[bold green][✓] EntropyStrip v{__version__} is installed globally and ready.[/bold green]\n"
+                    f"[bold green][✓] EntropyStrip v{__version__} is installed globally in your Windows PATH.[/bold green]\n"
                 )
         else:
             console.print(
                 f"[bold green][✓] EntropyStrip v{__version__} is ready.[/bold green]\n"
             )
 
-        console.print("[bold cyan]Interactive PE Triage Engine[/bold cyan]")
-        console.print("  • Drag and drop an executable (.exe / .dll) or directory into this window and press Enter.")
-        console.print("  • Or run from PowerShell / Command Prompt: [yellow]entropystrip <target-path>[/yellow]")
-        console.print("  • Type [yellow]--help[/yellow] to view all flags (--deep, --dump, --html, --json).\n")
+        console.print("[bold cyan]How to use EntropyStrip:[/bold cyan]")
+        console.print("Open [bold]Command Prompt[/bold] or [bold]PowerShell[/bold] and run:")
+        console.print("  • Single file triage:      [yellow]entropystrip file.exe --deep[/yellow]")
+        console.print("  • Scan whole directory:    [yellow]entropystrip C:\\folder -r --deep[/yellow]")
+        console.print("  • Carve embedded payloads: [yellow]entropystrip malware.exe --dump[/yellow]")
+        console.print("  • Generate HTML report:    [yellow]entropystrip malware.exe --html report.html[/yellow]")
+        console.print("  • View full help:          [yellow]entropystrip --help[/yellow]")
 
-        try:
-            user_input = input("Target path to scan (or press Enter to exit): ").strip().strip('"\'')
-        except (KeyboardInterrupt, EOFError):
-            return
-
-        if not user_input:
-            pause_if_needed()
-            return
-
-        if user_input.lower() in ("-h", "--help", "help"):
-            sys.argv.append("--help")
-            # fall through to argparse below
-        elif user_input.lower() in ("--install", "install"):
-            install_globally()
-            pause_if_needed()
-            return
-        elif user_input.lower() in ("--uninstall", "uninstall"):
-            uninstall_globally()
-            pause_if_needed()
-            return
-        else:
-            clean_target = os.path.abspath(os.path.normpath(user_input))
-            if os.path.isdir(clean_target):
-                scan_directory(clean_target)
-            elif os.path.isfile(clean_target):
-                analyze_single_file(clean_target, quiet=False)
-            else:
-                console.print(f"[red]Error: Target not found -> {user_input}[/red]")
-
-            pause_if_needed("\nScan complete. Press Enter to exit...")
-            return
+        pause_for_user()
+        return
 
     console.print(BANNER, style="cyan")
     parser = StandaloneArgumentParser(
@@ -156,17 +140,20 @@ def main() -> None:
 
     if args.install:
         install_globally()
-        pause_if_needed()
+        if is_explorer_launched():
+            pause_for_user()
         return
 
     if args.uninstall:
         uninstall_globally()
-        pause_if_needed()
+        if is_explorer_launched():
+            pause_for_user()
         return
 
     if not args.target:
         parser.print_help()
-        pause_if_needed()
+        if is_explorer_launched():
+            pause_for_user()
         return
 
     clean_target = os.path.abspath(os.path.normpath(args.target.strip().strip('"\'')))
@@ -190,7 +177,8 @@ def main() -> None:
             deep=args.deep,
         )
 
-    pause_if_needed("\nScan complete. Press Enter to exit...")
+    if is_explorer_launched():
+        pause_for_user("\nScan complete. Press Enter to exit...")
 
 
 if __name__ == "__main__":
