@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag to attach assets to (e.g. v1.2.3)"
+        description: "Release tag to attach assets to (leave blank to use current ref)"
         required: false
-        default: "v1.2.3"
+        default: ""
 
 permissions:
   contents: write
@@ -31,6 +31,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install build pyinstaller wheel pefile rich capstone
+          pip install -e . --no-deps
 
       - name: Build Python packages (wheel and sdist)
         run: |
