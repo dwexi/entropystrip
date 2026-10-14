@@ -309,7 +309,7 @@ def main() -> None:
             deep=args.deep,
             yara_rule_path=args.yara,
             enable_yara=args.yara is not None,
-            enable_bazaar=args.bazaar,
+            enable_bazaar=args.bazaar or bool(args.bazaar_key),
             bazaar_key=args.bazaar_key,
         )
     else:
@@ -322,7 +322,7 @@ def main() -> None:
             deep=args.deep,
             yara_rule_path=args.yara,
             enable_yara=args.yara is not None,
-            enable_bazaar=args.bazaar,
+            enable_bazaar=args.bazaar or bool(args.bazaar_key),
             bazaar_key=args.bazaar_key,
         )
 

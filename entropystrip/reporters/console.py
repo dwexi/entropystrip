@@ -90,6 +90,8 @@ def render_console_report(
                 escape(str(y.get("mitre") or "-")),
             )
         console.print(yara_table)
+    elif deep and yara_matches is not None:
+        console.print("[dim]YARA Signature Engine: Active - 0 rule matches (Threats: CobaltStrike, Ransomware, ReflectiveLoader, EggHunter).[/dim]")
 
     # Resource Tree Breakdown (.rsrc)
     if resources_info:
@@ -167,6 +169,8 @@ def render_console_report(
 def render_triage_leaderboard(
     results: List[Dict[str, Any]],
     clusters: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    yara_enabled: bool = False,
+    bazaar_enabled: bool = False,
 ) -> None:
     """Renders directory triage leaderboard ranked by threat score with campaign clusters."""
     triage_table = Table(
@@ -211,3 +215,17 @@ def render_triage_leaderboard(
             console.print(f"  • [bold magenta]{c_name}[/bold magenta] ({len(members)} binaries): [dim]{names}[/dim]")
 
     console.print(f"\n[green][+] Completed:[/green] Triaged {len(results)} binaries.")
+
+    if yara_enabled:
+        yara_matches_count = sum(len(r.get("yara_matches", [])) for r in results)
+        if yara_matches_count > 0:
+            console.print(f"  • [bold red]YARA Threat Detections:[/bold red] {yara_matches_count} matching rule(s) flagged.")
+        else:
+            console.print("  • [dim]YARA Signature Scan: Active (0 detections across triaged binaries).[/dim]")
+
+    if bazaar_enabled:
+        bazaar_hits = sum(1 for r in results if r.get("bazaar_intel") and r["bazaar_intel"].get("status") == "malicious")
+        if bazaar_hits > 0:
+            console.print(f"  • [bold red]MalwareBazaar Hits:[/bold red] {bazaar_hits} confirmed malicious sample(s).")
+        else:
+            console.print("  • [dim]MalwareBazaar Threat Intel: Active (0 matches in abuse.ch dataset).[/dim]")

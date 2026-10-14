@@ -840,6 +840,12 @@ def scan_directory(
         return []
 
     console.print(f"\n[bold magenta][*] Scanning Directory:[/bold magenta] {dir_path}")
+    if enable_yara or yara_rule_path is not None:
+        rule_desc = os.path.basename(yara_rule_path) if (yara_rule_path and yara_rule_path != "__default__") else "bundled threats.yar"
+        console.print(f"[dim]  • YARA Engine: Active (Scanning with {rule_desc})[/dim]")
+    if enable_bazaar:
+        console.print("[dim]  • Threat Intel: Active (Querying MalwareBazaar abuse.ch API)[/dim]")
+
     results: List[Dict[str, Any]] = []
 
     target_extensions = {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx", ".efi", ".bin"}
@@ -920,7 +926,12 @@ def scan_directory(
     clusters = cluster_samples(results, similarity_threshold=70)
 
     results.sort(key=lambda x: x["threat_score"], reverse=True)
-    render_triage_leaderboard(results, clusters=clusters)
+    render_triage_leaderboard(
+        results,
+        clusters=clusters,
+        yara_enabled=(enable_yara or yara_rule_path is not None),
+        bazaar_enabled=enable_bazaar,
+    )
 
     if json_out:
         out_dir = os.path.dirname(os.path.abspath(json_out))
