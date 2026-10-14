@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "entropystrip"
-version = "1.2.3.post1"
+version = "1.3.0"
 authors = [
   { name = "dwexi" }
 ]

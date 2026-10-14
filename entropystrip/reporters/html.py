@@ -357,7 +357,7 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
             <h1>EntropyStrip Triage Diagnostic</h1>
             <div class="target-path">{html.escape(str(telemetry.get('path', '')))}</div>
         </div>
-        <div style="color: #5c6370; font-size: 11px;">v1.2.3</div>
+        <div style="color: #5c6370; font-size: 11px;">v1.3.0</div>
     </div>
 
     <div class="meta-grid">
@@ -786,7 +786,7 @@ def generate_directory_html_report(
             <h1>Incident Triage Leaderboard</h1>
             <div class="target-path">{html.escape(target_dir)}</div>
         </div>
-        <div style="color: #5c6370; font-size: 11px;">v1.2.3</div>
+        <div style="color: #5c6370; font-size: 11px;">v1.3.0</div>
     </div>
 
     <div class="summary-grid">

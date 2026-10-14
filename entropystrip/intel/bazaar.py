@@ -35,7 +35,7 @@ def query_malware_bazaar(
     resolved_key = get_bazaar_api_key(api_key)
 
     headers = {
-        "User-Agent": "EntropyStrip-Forensic-Radar/1.2.3",
+        "User-Agent": "EntropyStrip-Forensic-Radar/1.3.0",
     }
     if resolved_key:
         headers["Auth-Key"] = resolved_key
