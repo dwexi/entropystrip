@@ -8,6 +8,7 @@ import os
 import sys
 import shutil
 import ctypes
+import subprocess
 from ctypes import wintypes
 from typing import Tuple, Optional
 
@@ -46,10 +47,30 @@ def is_in_user_path(target_dir: str) -> bool:
         return False
 
 
-def is_installed_globally() -> bool:
-    """Returns True if the binary is in the install directory and in User PATH."""
+def check_existing_install() -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Checks if EntropyStrip is already available globally in PATH.
+    Returns:
+        (is_installed: bool, install_type: 'standalone' | 'python' | None, path: Optional[str])
+    """
     install_dir, install_exe = get_install_paths()
-    return os.path.isfile(install_exe) and is_in_user_path(install_dir)
+    if os.path.isfile(install_exe) and is_in_user_path(install_dir):
+        return True, "standalone", install_exe
+
+    existing = shutil.which("entropystrip") or shutil.which("entropystrip.exe")
+    if existing:
+        curr_exe = getattr(sys, "executable", "")
+        # Ignore if found executable is simply the currently running binary in current working directory
+        if os.path.normcase(os.path.abspath(existing)) != os.path.normcase(os.path.abspath(curr_exe)):
+            return True, "python", existing
+
+    return False, None, None
+
+
+def is_installed_globally() -> bool:
+    """Returns True if EntropyStrip is available globally in Windows PATH (standalone or via Python)."""
+    installed, _, _ = check_existing_install()
+    return installed
 
 
 def broadcast_environment_change() -> None:
@@ -147,40 +168,76 @@ def install_globally(quiet: bool = False) -> bool:
         return False
 
 
-def uninstall_globally(quiet: bool = False) -> bool:
-    """Removes EntropyStrip from User PATH and deletes installed files."""
-    if sys.platform != "win32" or winreg is None:
+def uninstall_globally(quiet: bool = False, prompt_python: bool = True) -> bool:
+    """Removes EntropyStrip from User PATH and optionally from Python environment."""
+    if sys.platform != "win32":
         return False
 
     install_dir, install_exe = get_install_paths()
-    removed_path = False
+    removed_standalone = False
 
+    # 1. Clean registry and delete standalone installation
+    if winreg is not None:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                try:
+                    raw_path, reg_type = winreg.QueryValueEx(key, "Path")
+                    entries = [p.strip() for p in raw_path.split(";") if p.strip()]
+                    norm_install = os.path.normcase(os.path.normpath(install_dir))
+                    new_entries = [p for p in entries if os.path.normcase(os.path.normpath(p)) != norm_install]
+                    if len(new_entries) != len(entries):
+                        winreg.SetValueEx(key, "Path", 0, reg_type, ";".join(new_entries))
+                        removed_standalone = True
+                except FileNotFoundError:
+                    pass
+
+            if removed_standalone:
+                broadcast_environment_change()
+
+            if os.path.isdir(install_dir):
+                try:
+                    shutil.rmtree(install_dir)
+                    removed_standalone = True
+                except Exception:
+                    pass
+        except Exception as e:
+            if not quiet:
+                console.print(f"[red]Error removing standalone installation: {e}[/red]")
+
+    if removed_standalone and not quiet:
+        console.print("[green][✓] Standalone EntropyStrip successfully removed from Windows PATH.[/green]")
+
+    # 2. Check if installed in Python via pip
+    pip_found = False
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
-            try:
-                raw_path, reg_type = winreg.QueryValueEx(key, "Path")
-                entries = [p.strip() for p in raw_path.split(";") if p.strip()]
-                norm_install = os.path.normcase(os.path.normpath(install_dir))
-                new_entries = [p for p in entries if os.path.normcase(os.path.normpath(p)) != norm_install]
-                if len(new_entries) != len(entries):
-                    winreg.SetValueEx(key, "Path", 0, reg_type, ";".join(new_entries))
-                    removed_path = True
-            except FileNotFoundError:
-                pass
+        pip_exe = shutil.which("pip") or shutil.which("pip3")
+        if pip_exe:
+            check = subprocess.run([pip_exe, "show", "entropystrip"], capture_output=True, text=True)
+            if check.returncode == 0:
+                pip_found = True
+                if prompt_python and sys.stdin and sys.stdin.isatty():
+                    try:
+                        ans = input("\nEntropyStrip is also installed in your Python environment via pip.\nDo you want to uninstall it from Python too? [y/N]: ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        ans = "n"
+                    if ans in ("y", "yes"):
+                        res = subprocess.run([pip_exe, "uninstall", "-y", "entropystrip"], capture_output=True, text=True)
+                        if res.returncode == 0:
+                            if not quiet:
+                                console.print("[green][✓] Successfully uninstalled from Python environment.[/green]")
+                        else:
+                            if not quiet:
+                                console.print(f"[red]Error uninstalling from pip: {res.stderr}[/red]")
+                    else:
+                        if not quiet:
+                            console.print("[dim]Python package retained.[/dim]")
+                else:
+                    if not quiet:
+                        console.print("[dim]Note: EntropyStrip is also installed in Python. Run 'pip uninstall entropystrip' to remove it from Python.[/dim]")
+    except Exception:
+        pass
 
-        if removed_path:
-            broadcast_environment_change()
+    if not removed_standalone and not pip_found and not quiet:
+        console.print("[dim]EntropyStrip was not found in Windows PATH or Python environment.[/dim]")
 
-        if os.path.isdir(install_dir):
-            try:
-                shutil.rmtree(install_dir)
-            except Exception:
-                pass
-
-        if not quiet:
-            console.print("[green][✓] EntropyStrip successfully uninstalled from global PATH.[/green]")
-        return True
-    except Exception as e:
-        if not quiet:
-            console.print(f"[red]Error uninstalling: {e}[/red]")
-        return False
+    return True

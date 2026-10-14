@@ -10,12 +10,12 @@ import ctypes
 try:
     from .reporters.console import console
     from .core import analyze_single_file, scan_directory
-    from .installer import is_installed_globally, install_globally, uninstall_globally
+    from .installer import is_installed_globally, install_globally, uninstall_globally, check_existing_install
     from . import __version__
 except (ImportError, ValueError):
     from entropystrip.reporters.console import console
     from entropystrip.core import analyze_single_file, scan_directory
-    from entropystrip.installer import is_installed_globally, install_globally, uninstall_globally
+    from entropystrip.installer import is_installed_globally, install_globally, uninstall_globally, check_existing_install
     from entropystrip import __version__
 
 try:
@@ -99,7 +99,13 @@ def run_interactive_menu() -> None:
     Offers global PATH registration, then provides the interactive forensic scanner.
     """
     if sys.platform == "win32":
-        if not is_installed_globally():
+        is_installed, install_type, exe_p = check_existing_install()
+        if is_installed:
+            if install_type == "python":
+                console.print("[bold green][✓] EntropyStrip is already available globally in your PATH (via Python / pip).[/bold green]\n")
+            else:
+                console.print(f"[bold green][✓] EntropyStrip v{__version__} is installed globally in your Windows PATH.[/bold green]\n")
+        else:
             console.print("[bold yellow]EntropyStrip is not registered in your Windows PATH.[/bold yellow]")
             try:
                 choice = input("Do you want to install EntropyStrip to your Windows PATH? [Y/n]: ").strip().lower()
@@ -110,8 +116,6 @@ def run_interactive_menu() -> None:
                 install_globally()
             else:
                 console.print("[dim]Installation skipped.[/dim]\n")
-        else:
-            console.print(f"[bold green][✓] EntropyStrip v{__version__} is installed globally in your Windows PATH.[/bold green]\n")
 
     console.print("[bold cyan]Interactive PE Forensic Triage Engine[/bold cyan]")
     console.print("  * Drag and drop an executable (.exe / .dll) or directory into this window, or paste path.\n")
