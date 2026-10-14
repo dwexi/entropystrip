@@ -10,10 +10,12 @@ import ctypes
 try:
     from .reporters.console import console
     from .core import analyze_single_file, scan_directory
+    from .installer import is_installed_globally, install_globally, uninstall_globally
     from . import __version__
 except (ImportError, ValueError):
     from entropystrip.reporters.console import console
     from entropystrip.core import analyze_single_file, scan_directory
+    from entropystrip.installer import is_installed_globally, install_globally, uninstall_globally
     from entropystrip import __version__
 
 try:
@@ -94,8 +96,23 @@ class StandaloneArgumentParser(argparse.ArgumentParser):
 def run_interactive_menu() -> None:
     """
     Interactive triage mode for Windows Explorer double-clicks.
-    Prevents the window from closing and guides the user through scanning.
+    Offers global PATH registration, then provides the interactive forensic scanner.
     """
+    if sys.platform == "win32":
+        if not is_installed_globally():
+            console.print("[bold yellow]EntropyStrip is not registered in your Windows PATH.[/bold yellow]")
+            try:
+                choice = input("Do you want to install EntropyStrip to your Windows PATH? [Y/n]: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                choice = "n"
+
+            if choice in ("", "y", "yes"):
+                install_globally()
+            else:
+                console.print("[dim]Installation skipped.[/dim]\n")
+        else:
+            console.print(f"[bold green][✓] EntropyStrip v{__version__} is installed globally in your Windows PATH.[/bold green]\n")
+
     console.print("[bold cyan]Interactive PE Forensic Triage Engine[/bold cyan]")
     console.print("  * Drag and drop an executable (.exe / .dll) or directory into this window, or paste path.\n")
 
@@ -197,9 +214,23 @@ def main() -> None:
         help="Deep forensic triage: MITRE ATT&CK mapping, entry point disassembly, and hashes",
     )
     parser.add_argument("-i", "--interactive", action="store_true", help="Launch interactive triage wizard")
+    parser.add_argument("--install", action="store_true", help="Install EntropyStrip globally to Windows PATH")
+    parser.add_argument("--uninstall", action="store_true", help="Uninstall EntropyStrip from Windows PATH")
     parser.add_argument("--html", help="Path to write HTML report")
     parser.add_argument("--json", help="Path to write JSON telemetry")
     args = parser.parse_args()
+
+    if args.install:
+        install_globally()
+        if is_explorer_launched():
+            pause_for_user()
+        return
+
+    if args.uninstall:
+        uninstall_globally()
+        if is_explorer_launched():
+            pause_for_user()
+        return
 
     if args.interactive:
         run_interactive_menu()
