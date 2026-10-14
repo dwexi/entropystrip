@@ -9,10 +9,12 @@ import ctypes
 try:
     from .reporters.console import console
     from .core import analyze_single_file, scan_directory
+    from .installer import is_installed_globally, install_globally, uninstall_globally
     from . import __version__
 except (ImportError, ValueError):
     from entropystrip.reporters.console import console
     from entropystrip.core import analyze_single_file, scan_directory
+    from entropystrip.installer import is_installed_globally, install_globally, uninstall_globally
     from entropystrip import __version__
 
 try:
@@ -68,9 +70,19 @@ def main() -> None:
     # If launched with no arguments (e.g. double-clicked from File Explorer)
     if len(sys.argv) == 1:
         console.print(BANNER, style="cyan")
-        console.print(
-            f"[bold green][✓] EntropyStrip v{__version__} is successfully installed and ready.[/bold green]\n"
-        )
+        if sys.platform == "win32":
+            if not is_installed_globally():
+                console.print("[cyan][*] Setting up EntropyStrip globally on Windows...[/cyan]")
+                install_globally()
+            else:
+                console.print(
+                    f"[bold green][✓] EntropyStrip v{__version__} is installed globally and ready.[/bold green]\n"
+                )
+        else:
+            console.print(
+                f"[bold green][✓] EntropyStrip v{__version__} is ready.[/bold green]\n"
+            )
+
         console.print("[bold cyan]Interactive PE Triage Engine[/bold cyan]")
         console.print("  • Drag and drop an executable (.exe / .dll) or directory into this window and press Enter.")
         console.print("  • Or run from PowerShell / Command Prompt: [yellow]entropystrip <target-path>[/yellow]")
@@ -88,6 +100,14 @@ def main() -> None:
         if user_input.lower() in ("-h", "--help", "help"):
             sys.argv.append("--help")
             # fall through to argparse below
+        elif user_input.lower() in ("--install", "install"):
+            install_globally()
+            pause_if_needed()
+            return
+        elif user_input.lower() in ("--uninstall", "uninstall"):
+            uninstall_globally()
+            pause_if_needed()
+            return
         else:
             clean_target = os.path.abspath(os.path.normpath(user_input))
             if os.path.isdir(clean_target):
@@ -112,7 +132,17 @@ def main() -> None:
         version=f"%(prog)s {__version__}",
         help="Show program's version number and exit",
     )
-    parser.add_argument("target", help="Path to Windows executable (.exe / .dll) or directory")
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Install EntropyStrip globally to %%LOCALAPPDATA%%\\Programs\\EntropyStrip and add to User PATH",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Uninstall EntropyStrip from global PATH and remove installed files",
+    )
+    parser.add_argument("target", nargs="?", default=None, help="Path to Windows executable (.exe / .dll) or directory")
     parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scan subdirectories")
     parser.add_argument("--dump", action="store_true", help="Carve high-entropy payloads to extracted_payloads/")
     parser.add_argument(
@@ -123,6 +153,21 @@ def main() -> None:
     parser.add_argument("--html", help="Path to write HTML report")
     parser.add_argument("--json", help="Path to write JSON telemetry")
     args = parser.parse_args()
+
+    if args.install:
+        install_globally()
+        pause_if_needed()
+        return
+
+    if args.uninstall:
+        uninstall_globally()
+        pause_if_needed()
+        return
+
+    if not args.target:
+        parser.print_help()
+        pause_if_needed()
+        return
 
     clean_target = os.path.abspath(os.path.normpath(args.target.strip().strip('"\'')))
 
