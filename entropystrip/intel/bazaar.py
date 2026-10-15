@@ -4,6 +4,7 @@ Queries sample hash reputation, malware family signatures, tags, and community t
 """
 
 import json
+import urllib.parse
 from typing import Optional, Dict, Any
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -11,6 +12,15 @@ from .config import get_bazaar_api_key
 
 MALWAREBAZAAR_ENDPOINT = "https://mb-api.abuse.ch/api/v1/"
 _BAZAAR_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+_CONSECUTIVE_FAILURES = 0
+_CIRCUIT_OPEN = False
+
+
+def reset_circuit_breaker() -> None:
+    """Resets the circuit breaker state (useful for tests and new scan runs)."""
+    global _CONSECUTIVE_FAILURES, _CIRCUIT_OPEN
+    _CONSECUTIVE_FAILURES = 0
+    _CIRCUIT_OPEN = False
 
 
 def query_malware_bazaar(
@@ -21,12 +31,18 @@ def query_malware_bazaar(
     """
     Queries MalwareBazaar API for hash classification, signature, and community tags.
     Results are cached in-memory to prevent redundant queries during batch scans.
+    Employs circuit breaker and negative caching for resilience in offline / throttled networks.
     
     Returns:
         Structured intel dictionary if known, or None if network fails / unknown.
     """
+    global _CONSECUTIVE_FAILURES, _CIRCUIT_OPEN
+
     clean_hash = sha256_hash.strip().lower()
     if not clean_hash or len(clean_hash) != 64:
+        return None
+
+    if _CIRCUIT_OPEN:
         return None
 
     if clean_hash in _BAZAAR_CACHE:
@@ -46,8 +62,8 @@ def query_malware_bazaar(
     }
 
     try:
-        data_encoded = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        data_encoded = urllib.parse.urlencode(payload).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
         
         req = Request(
             url=MALWAREBAZAAR_ENDPOINT,
@@ -66,13 +82,18 @@ def query_malware_bazaar(
                 
                 vt_data = None
                 intel = sample_info.get("intelligence", {})
-                if intel and "virustotal" in intel:
+                if intel and "virustotal" in intel and isinstance(intel["virustotal"], dict):
                     vt = intel["virustotal"]
+                    raw_pct = vt.get("percent")
+                    pct_val = float(raw_pct) if raw_pct is not None else 0.0
                     vt_data = {
-                        "percent": vt.get("percent"),
-                        "positives": vt.get("positives"),
-                        "total": vt.get("total"),
+                        "percent": pct_val,
+                        "positives": int(vt.get("positives") or 0),
+                        "total": int(vt.get("total") or 0),
                     }
+
+                raw_tags = sample_info.get("tags") or []
+                clean_tags = [str(t) for t in raw_tags if t is not None]
 
                 intel_result = {
                     "status": "malicious",
@@ -81,7 +102,7 @@ def query_malware_bazaar(
                     "signature": sample_info.get("signature") or "Unknown Malware Family",
                     "file_type": sample_info.get("file_type"),
                     "mime_type": sample_info.get("file_type_mime"),
-                    "tags": sample_info.get("tags") or [],
+                    "tags": clean_tags,
                     "reporter": sample_info.get("reporter"),
                     "first_seen": sample_info.get("first_seen"),
                     "last_seen": sample_info.get("last_seen"),
@@ -89,6 +110,7 @@ def query_malware_bazaar(
                     "virustotal": vt_data,
                 }
                 _BAZAAR_CACHE[clean_hash] = intel_result
+                _CONSECUTIVE_FAILURES = 0
                 return intel_result
 
             elif query_status == "hash_not_found":
@@ -100,6 +122,7 @@ def query_malware_bazaar(
                     "message": "Hash not found in MalwareBazaar dataset (0 community reports)",
                 }
                 _BAZAAR_CACHE[clean_hash] = intel_result
+                _CONSECUTIVE_FAILURES = 0
                 return intel_result
 
             else:
@@ -107,5 +130,8 @@ def query_malware_bazaar(
                 return None
 
     except (URLError, HTTPError, TimeoutError, json.JSONDecodeError, Exception):
-        # Network lookup failures must never interrupt local triage
+        _BAZAAR_CACHE[clean_hash] = None
+        _CONSECUTIVE_FAILURES += 1
+        if _CONSECUTIVE_FAILURES >= 3:
+            _CIRCUIT_OPEN = True
         return None

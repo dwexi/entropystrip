@@ -164,6 +164,19 @@ def _score_strings(s1: str, s2: str) -> int:
     """Calculates normalized match score for two piecewise strings."""
     if not s1 or not s2:
         return 0
+    # Enforce minimum string length to prevent degenerate false-positive collisions (D2-01)
+    if min(len(s1), len(s2)) < 4:
+        return 100 if (s1 == s2 and len(s1) >= 4) else 0
+
+    # Require a minimum common contiguous substring of at least 4 characters
+    has_common = False
+    for i in range(len(s1) - 3):
+        if s1[i : i + 4] in s2:
+            has_common = True
+            break
+    if not has_common:
+        return 0
+
     if s1 == s2:
         return 100
 
