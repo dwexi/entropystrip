@@ -18,13 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MalwareBazaar threat intelligence client (`--bazaar`, `--bazaar-key`) that queries the abuse.ch API for malware family names, community tags, first-seen dates, and VirusTotal ratios.
 - Negative caching and a three-strike circuit breaker in the MalwareBazaar client to avoid timeout stalls on offline or rate-limited networks.
 - Interactive incident triage leaderboard in terminal output and standalone HTML reports (`--html`), with summary cards and campaign clusters.
-- Standalone 53-test automated resilience suite (`test_resilience_audit.py`) covering PE parser bounds, math heuristics, filesystem edge cases, network fallbacks, and output sanitization.
+- Standalone automated resilience and boundary test suites (`test_resilience_audit.py`, `test_bug_hunter_suite.py`) covering PE parser limits, math heuristics, filesystem edge cases, and output sanitization.
 
 ### Fixed
 - Overlay detection now measures physical raw data bounds rather than header-declared `SizeOfRawData`, which prevents inflated section sizes from hiding appended payloads.
 - Guaranteed `pe.close()` execution via `try...finally` cleanup to prevent file locking issues on Windows (`WinError 32`).
-- Capped per-section buffering at 2 MB during ingestion, keeping process RAM under 50 MB on multi-gigabyte binaries.
-- Strided 5-chunk sampling across large buffers in `sample_large_buffer`, eliminating blind spots for payloads in the middle of multi-megabyte files.
+- Capped per-section buffering at 2 MB during ingestion to keep process RAM under 50 MB on multi-gigabyte binaries.
+- Strided 5-chunk sampling across large buffers in `sample_large_buffer` to eliminate blind spots for payloads in the middle of multi-megabyte files.
 - Rejection of Win32 reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`) before filesystem operations to prevent terminal hangs.
 - Path normalization for long network shares using the `\\?\UNC\server\share` namespace format.
 - Telemetry capture for files locked by running processes (`PermissionError`) instead of silently dropping them from scan results.
@@ -46,10 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Safe string coercion for tags lists to avoid `TypeError` on unexpected API output.
 - Config parser dictionary validation so corrupted or list-based JSON files return an empty dictionary instead of throwing `AttributeError`.
 - Entry point and TLS callback disassembly fall back to `pe.get_data` when physical file offsets exceed the initial buffer slice on large binaries.
-- ARM64 disassembly mode set to `CS_ARCH_ARM64` and `CS_MODE_ARM` in Capstone, correcting instruction decoding on 64-bit ARM Windows binaries.
-- System32 DLL masquerade detection verifies the directory path boundary against the real Windows directory, blocking path bypasses from deceptive subdirectories.
-- Reserved Win32 device name filtering strips trailing spaces and periods, blocking filesystem evasions like `NUL.` or `CON `.
-- Pure-Python fallback YARA engine reads up to 16 MB directly from disk for large binaries, catching threat signatures located in overlays and tail sections.
+- ARM64 disassembly mode set to `CS_ARCH_ARM64` and `CS_MODE_ARM` in Capstone to correct instruction decoding on 64-bit ARM Windows binaries.
+- System32 DLL masquerade detection verifies the directory path boundary against the real Windows directory to block path bypasses from deceptive subdirectories.
+- Reserved Win32 device name filtering strips trailing spaces and periods to block filesystem evasions like `NUL.` or `CON `.
+- Pure-Python fallback YARA engine reads up to 16 MB directly from disk for large binaries to detect threat signatures located in overlays and tail sections.
 
 ### Security
 - Stored XSS defense in HTML reports: properly escaped masqueraded DLL names, binary paths, hashes, and document titles.
