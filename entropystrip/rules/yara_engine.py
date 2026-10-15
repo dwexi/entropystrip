@@ -266,12 +266,13 @@ def scan_yara(
     Scans binary bytes or file with compiled YARA rules.
     Falls back to pure-Python signature engine if yara-python is not compiled.
     """
-    if not data and file_path and os.path.isfile(file_path):
-        try:
-            with open(file_path, "rb") as f:
-                data = f.read(16 * 1024 * 1024)
-        except Exception:
-            data = b""
+    if file_path and os.path.isfile(file_path):
+        if not data or len(data) < 16 * 1024 * 1024:
+            try:
+                with open(file_path, "rb") as f:
+                    data = f.read(16 * 1024 * 1024)
+            except Exception:
+                pass
 
     if not data and not file_path:
         return []

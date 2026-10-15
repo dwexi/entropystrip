@@ -109,7 +109,7 @@ def is_win32_reserved_name(p: str) -> bool:
         return False
     clean = p.strip().strip('"\'')
     base = os.path.basename(clean)
-    stem = base.split(".")[0].upper()
+    stem = base.split(".")[0].rstrip(" .").upper()
     return stem in WIN32_RESERVED_NAMES
 
 
