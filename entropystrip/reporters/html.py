@@ -114,12 +114,14 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
         pos_val = vt.get("positives") or 0
         tot_val = vt.get("total") or 0
         vt_str = f"{pct_val:.1f}% ({pos_val}/{tot_val})" if vt else "N/A"
+        raw_tags = bazaar.get("tags") or []
+        tags_str = ", ".join(str(t) for t in raw_tags if t is not None)
         bazaar_html = f"""
         <div class="findings-card" style="border-left: 3px solid #e06c75; margin-bottom: 20px;">
             <h3 style="color:#e06c75;">MalwareBazaar Threat Intelligence (abuse.ch)</h3>
             <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:8px;">
                 <div><span style="color:#5c6370; font-size:10px;">SIGNATURE:</span> <b style="color:#e06c75;">{html.escape(str(bazaar.get('signature', 'Unknown Threat')))}</b></div>
-                <div><span style="color:#5c6370; font-size:10px;">TAGS:</span> <span>{html.escape(', '.join(bazaar.get('tags', [])))}</span></div>
+                <div><span style="color:#5c6370; font-size:10px;">TAGS:</span> <span>{html.escape(tags_str)}</span></div>
                 <div><span style="color:#5c6370; font-size:10px;">FIRST SEEN:</span> <span>{html.escape(str(bazaar.get('first_seen', '-')))}</span></div>
                 <div><span style="color:#5c6370; font-size:10px;">VIRUSTOTAL:</span> <span style="color:#e06c75; font-weight:600;">{html.escape(vt_str)}</span></div>
             </div>

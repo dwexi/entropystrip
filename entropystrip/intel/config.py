@@ -29,20 +29,36 @@ def load_config() -> Dict[str, Any]:
     if os.path.isfile(cfg_path):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+                return {}
         except Exception:
             return {}
     return {}
 
 
 def save_config(cfg: Dict[str, Any]) -> bool:
-    """Saves configuration dictionary to ~/.entropystrip/config.json."""
+    """Saves configuration dictionary to ~/.entropystrip/config.json atomically with restricted permissions."""
+    if not isinstance(cfg, dict):
+        return False
+    cfg_dir = get_config_dir()
     cfg_path = get_config_path()
+    tmp_path = os.path.join(cfg_dir, f"config.tmp.{os.getpid()}")
     try:
-        with open(cfg_path, "w", encoding="utf-8") as f:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        fd = os.open(tmp_path, flags, mode)
+        with open(fd, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        os.replace(tmp_path, cfg_path)
         return True
     except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
         return False
 
 

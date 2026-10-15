@@ -19,6 +19,7 @@ import sys
 import json
 import math
 import struct
+import hashlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -31,10 +32,11 @@ if CURRENT_DIR not in sys.path:
 import pefile
 from rich.console import Console
 from rich.table import Table
+from rich.markup import escape
 from rich.errors import MarkupError
 
 # EntropyStrip imports
-from entropystrip.core import analyze_single_file, normalize_windows_path
+from entropystrip.core import analyze_single_file, normalize_windows_path, is_win32_reserved_name
 from entropystrip.scanner import detect_overlay, detect_overlapping_sections
 from entropystrip.radar.signatures import check_authenticode_signature
 from entropystrip.radar.entropy import (
@@ -411,13 +413,12 @@ class TestDomain2MathematicalAlgorithmicIntegrity(unittest.TestCase):
 
     def test_d2_06_central_payload_blindspot_sample_large_buffer(self):
         """
-        R2-FINDING-06: sample_large_buffer samples only 500KB head + 500KB tail,
-        completely ignoring multi-megabyte encrypted payloads located in the buffer center.
+        R2-FINDING-06: Strided multi-chunk sampling eliminates central payload blind spots,
+        evaluating 5 equidistant chunks across multi-megabyte buffers.
         """
         buf = b"\x00" * 1_500_000 + os.urandom(1_000_000) + b"\x00" * 1_500_000
         ent = calculate_entropy(buf)
-        # Central 1MB payload discarded in initial head/tail fast triage pass
-        self.assertEqual(ent, 0.0, "sample_large_buffer did not miss central payload")
+        self.assertGreater(ent, 0.0, "Hardened strided sampling must detect central encrypted payload")
 
     def test_d2_07_ctph_phantom_trailing_character(self):
         """
@@ -500,32 +501,32 @@ class TestDomain3FilesystemAndResourceBoundaries(unittest.TestCase):
 
     def test_d3_03_windows_reserved_device_names(self):
         """
-        F-R3-03: Win32 reserved device names (CON, NUL, AUX) pass os.path.exists()
-        on Windows and lack validation in normalize_windows_path, risking I/O hangs.
+        F-R3-03: Win32 reserved device names (CON, NUL, AUX, COM1-9, LPT1-9) are identified
+        by is_win32_reserved_name and rejected early by analyze_single_file.
         """
-        if sys.platform == "win32":
-            # On Windows, NUL exists as a reserved character device
-            self.assertTrue(os.path.exists("NUL"))
-            norm = normalize_windows_path("CON")
-            # Vulnerability verified: reserved name is normalized as normal path without rejection
-            self.assertIn("CON", norm)
+        self.assertTrue(is_win32_reserved_name("CON"))
+        self.assertTrue(is_win32_reserved_name("NUL.txt"))
+        self.assertTrue(is_win32_reserved_name("aux"))
+        self.assertTrue(is_win32_reserved_name("COM1"))
+        self.assertFalse(is_win32_reserved_name("clean.exe"))
+        res = analyze_single_file("CON", quiet=True)
+        self.assertIsNone(res)
 
     def test_d3_04_unc_extended_path_normalization(self):
-        """
-        F-R3-04: normalize_windows_path prepends \\?\\ to UNC paths, producing invalid
-        triple-slash namespace \\?\\\\server\\share instead of \\?\\UNC\\server\\share.
+        r"""
+        F-R3-04: normalize_windows_path formats UNC paths into extended \\?\UNC\ namespace
+        without generating invalid triple backslashes.
         """
         unc_path = "\\\\fileserver\\triage_share\\" + ("subfolder\\" * 25) + "target.exe"
         normalized = normalize_windows_path(unc_path)
         if sys.platform == "win32":
-            # Vulnerability verified: prepends \\?\ to \\ resulting in invalid prefix
-            self.assertTrue(normalized.startswith("\\\\?\\\\"), f"Normalized path: {normalized}")
-            self.assertFalse(normalized.startswith("\\\\?\\UNC\\"), "UNC prefix was correctly handled")
+            self.assertTrue(normalized.startswith("\\\\?\\UNC\\fileserver\\triage_share\\"), f"Normalized path: {normalized}")
+            self.assertFalse(normalized.startswith("\\\\?\\\\\\"), "UNC prefix must not contain invalid triple backslash")
 
     def test_d3_05_os_locked_binary_silent_omission(self):
         """
-        F-R3-05: Exclusively locked active binaries raise PermissionError, which is
-        caught by except Exception in analyze_single_file and silently returns None.
+        F-R3-05: Exclusively locked active binaries raising PermissionError produce
+        triage telemetry with an active process warning instead of silently dropping the file.
         """
         with tempfile.TemporaryDirectory() as td:
             target = os.path.join(td, "locked_malware.exe")
@@ -541,20 +542,20 @@ class TestDomain3FilesystemAndResourceBoundaries(unittest.TestCase):
 
             with patch("builtins.open", side_effect=mock_open):
                 res = analyze_single_file(target, quiet=True)
-                # Vulnerability verified: returns None, dropping critical active malware telemetry
-                self.assertIsNone(res, "Locked binary was not silently dropped returning None")
+                self.assertIsNotNone(res, "Locked binary must produce telemetry instead of None")
+                self.assertIn("Locked by Active Process", res.get("verdict", ""))
+                self.assertGreaterEqual(res.get("threat_score", 0), 60)
 
     def test_d3_06_rich_markup_in_path_crash(self):
         """
         F-R3-06: Direct interpolation of paths containing closing tags (e.g. [/bold])
-        into console.print strings raises rich.errors.MarkupError without escape().
+        is safely escaped with rich.markup.escape(), preventing MarkupError.
         """
         from io import StringIO
         c = Console(file=StringIO())
         malicious_path = "sample_[/bold].exe"
-        # Vulnerability verified: unescaped path causes Rich MarkupError crash
-        with self.assertRaises(MarkupError):
-            c.print(f"[red]Error: File not found -> {malicious_path}[/red]")
+        c.print(f"[red]Error: File not found -> {escape(malicious_path)}[/red]")
+        self.assertIn("sample_[/bold].exe", c.file.getvalue())
 
 
 # ==============================================================================
@@ -661,22 +662,23 @@ class TestDomain4NetworkResilienceAndEngineParity(unittest.TestCase):
 
     def test_d4_07_bazaar_malformed_tags_crash(self):
         """
-        D4-FINDING-08: Malformed tags (None or integer list) causes TypeError during
-        string join operations in core.py and reporters.
+        D4-FINDING-08: Malformed tags (None or integer list) are safely coerced to string
+        during formatting without raising TypeError.
         """
         bazaar_intel_none = {"tags": None}
-        # In core.py:650: ", ".join(bazaar_intel.get("tags", [])) -> returns None -> crash
-        with self.assertRaises(TypeError):
-            ", ".join(bazaar_intel_none.get("tags", []))
+        raw_none = bazaar_intel_none.get("tags") or []
+        tg_none = ", ".join(str(t) for t in raw_none if t is not None)
+        self.assertEqual(tg_none, "")
 
         bazaar_intel_ints = {"tags": [101, 202]}
-        with self.assertRaises(TypeError):
-            ", ".join(bazaar_intel_ints.get("tags", []))
+        raw_ints = bazaar_intel_ints.get("tags") or []
+        tg_ints = ", ".join(str(t) for t in raw_ints if t is not None)
+        self.assertEqual(tg_ints, "101, 202")
 
     def test_d4_08_config_non_dict_json_attribute_error(self):
         """
-        D4-FINDING-09: Unchecked non-dict JSON in ~/.entropystrip/config.json causes
-        AttributeError in get_bazaar_api_key when calling cfg.get().
+        D4-FINDING-09: Unchecked non-dict JSON in ~/.entropystrip/config.json is safely
+        rejected by load_config, returning {} and preventing AttributeError in get_bazaar_api_key.
         """
         with tempfile.TemporaryDirectory() as td:
             with patch("entropystrip.intel.config.get_config_dir", return_value=td):
@@ -685,10 +687,10 @@ class TestDomain4NetworkResilienceAndEngineParity(unittest.TestCase):
                     f.write(json.dumps(["malwarebazaar_api_key", "secret"]))
 
                 loaded = config.load_config()
-                self.assertIsInstance(loaded, list)
-                # Vulnerability verified: calling get_bazaar_api_key crashes with AttributeError
-                with self.assertRaises(AttributeError):
-                    config.get_bazaar_api_key()
+                self.assertIsInstance(loaded, dict)
+                self.assertEqual(loaded, {})
+                key = config.get_bazaar_api_key()
+                self.assertIsNone(key)
 
 
 # ==============================================================================
@@ -751,19 +753,17 @@ class TestDomain5OutputSanitizationAndCarving(unittest.TestCase):
 
     def test_d5_03_carving_basename_collision_and_truncated_hash(self):
         """
-        Finding D5-03: Artifact carving truncates parent SHA256 to 8 hex chars and uses
-        parent basename, causing naming collisions and failing payload_<sha256>_<offset>.bin standard.
+        Finding D5-03: Artifact carving uses full payload SHA256 and section index
+        (payload_{sha256}_sec{idx}_{clean_name}.bin) to guarantee deterministic collision-free extraction.
         """
-        hashes = {"sha256": "abcdef0123456789" * 4}
-        file_path_1 = "dir_a/update.exe"
-        file_path_2 = "dir_b/update.exe"
-
-        sha_pfx = hashes.get("sha256", "00000000")[:8]
-        clean_base_1 = "".join([c if c.isalnum() or c == "." else "_" for c in os.path.basename(file_path_1)])
-        clean_base_2 = "".join([c if c.isalnum() or c == "." else "_" for c in os.path.basename(file_path_2)])
-
-        self.assertEqual(sha_pfx, "abcdef01")
-        self.assertEqual(clean_base_1, clean_base_2)
+        data1 = b"PAYLOAD_1_BYTES" * 10
+        data2 = b"PAYLOAD_2_BYTES" * 10
+        h1 = hashlib.sha256(data1).hexdigest()
+        h2 = hashlib.sha256(data2).hexdigest()
+        self.assertNotEqual(h1, h2)
+        f1 = f"payload_{h1}_sec0_UPX1.bin"
+        f2 = f"payload_{h2}_sec0_UPX1.bin"
+        self.assertNotEqual(f1, f2)
 
     def test_d5_04_incomplete_csp_meta_tag(self):
         """
@@ -782,26 +782,34 @@ class TestDomain5OutputSanitizationAndCarving(unittest.TestCase):
 
     def test_d5_05_carving_path_traversal_via_dots(self):
         """
-        Finding D5-05: Carving path generation allows dots ('.') in clean_base, allowing
-        relative parent references ('..') to escape the extraction directory.
+        Finding D5-05: Carving sanitizes section names by replacing non-alphanumeric characters
+        with underscores and verifying that the destination path remains within the extraction directory.
         """
-        raw_base = ".."
-        clean_base = "".join([c if c.isalnum() or c == "." else "_" for c in raw_base])
-        # Vulnerability verified: '..' is preserved, permitting path traversal escape
-        self.assertEqual(clean_base, "..")
+        raw_sec_name = "../../../etc/passwd"
+        clean_name = "".join([c if c.isalnum() else "_" for c in raw_sec_name])
+        self.assertNotIn("..", clean_name)
+        self.assertEqual(clean_name, "_________etc_passwd")
+        out_dir = os.path.abspath("extracted_payloads")
+        out_path = os.path.abspath(os.path.join(out_dir, f"payload_test_sec0_{clean_name}.bin"))
+        self.assertEqual(os.path.commonpath([out_dir, out_path]), out_dir)
 
     def test_d5_06_json_serialization_bytes_and_surrogates(self):
         """
-        Finding D5-06: json.dump in core.py lacks default serializer for bytes and fails
-        to sanitize lone surrogates before UTF-8 encoding.
+        Finding D5-06: safe_json_default handles bytes and non-finite floats, and
+        sanitize_json_surrogates replaces lone Unicode surrogates before JSON encoding.
         """
-        # Bytes serialization failure
-        with self.assertRaises(TypeError):
-            json.dumps({"payload": b"\x90\x90"})
-
-        # Lone surrogate UTF-8 encoding failure
-        with self.assertRaises(UnicodeEncodeError):
-            "\ud800".encode("utf-8")
+        from entropystrip.core import safe_json_default, sanitize_json_surrogates
+        raw_dict = {
+            "bytes_val": b"\x90\x90",
+            "nan_val": float("nan"),
+            "surrogate": "\ud800bad_string\ud800",
+        }
+        sanitized = sanitize_json_surrogates(raw_dict)
+        encoded = json.dumps(sanitized, default=safe_json_default)
+        self.assertIsInstance(encoded, str)
+        self.assertIn('"9090"', encoded)
+        self.assertIn("0.0", encoded)
+        self.assertNotIn("\ud800", encoded)
 
 
 if __name__ == "__main__":

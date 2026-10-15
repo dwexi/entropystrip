@@ -71,10 +71,12 @@ def compile_yara_rules(custom_path: Optional[str] = None) -> Optional[Any]:
         compiled = yara.compile(filepaths=filepaths)
         _COMPILED_RULES_CACHE[cache_key] = compiled
         return compiled
-    except Exception:
+    except Exception as err:
         # If compilation of combined rules fails (e.g. duplicate identifier or syntax error in custom file),
-        # fall back to default rules alone
+        # fall back to default rules alone and emit warning (D4-11)
         if custom_path:
+            import sys
+            sys.stderr.write(f"[WARNING] Custom YARA compilation failed: {err}. Falling back to default rules.\n")
             default_fps = {f"default_{os.path.basename(p)}": p for p in get_default_rule_paths()}
             if default_fps:
                 try:

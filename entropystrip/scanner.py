@@ -638,8 +638,98 @@ def inspect_pe_resources(
     if not hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
         return resources_telemetry, anomalies, 0, carveable_payloads
 
+    MAX_RSRC_ENTRIES = 500
+    entries_processed = 0
+
+    def process_data_entry(data_entry, type_str, type_id, res_id):
+        nonlocal threat_penalty, entries_processed
+        if not data_entry or not hasattr(data_entry, "struct"):
+            return
+        if entries_processed >= MAX_RSRC_ENTRIES:
+            return
+        entries_processed += 1
+
+        rva = getattr(data_entry.struct, "OffsetToData", 0)
+        size = getattr(data_entry.struct, "Size", 0)
+        if rva == 0 or size == 0:
+            return
+
+        try:
+            res_bytes = pe.get_data(rva, size)
+        except Exception:
+            res_bytes = b""
+
+        if not res_bytes:
+            return
+
+        res_identifier = f"{type_str}/{res_id}"
+        ent = calculate_entropy(res_bytes)
+        is_suspicious = False
+        status = "OK"
+
+        # 1. Embedded Executable Detection (Hidden PE inside resource)
+        is_embedded_pe = False
+        if len(res_bytes) >= 64 and res_bytes[:2] == b"MZ":
+            try:
+                e_lfanew = struct.unpack("<I", res_bytes[60:64])[0]
+                if 64 <= e_lfanew <= len(res_bytes) - 4 and res_bytes[e_lfanew : e_lfanew + 4] == b"PE\x00\x00":
+                    is_embedded_pe = True
+            except Exception:
+                pass
+
+        if is_embedded_pe:
+            anomalies.append(
+                f"Resource Steganography: Embedded PE executable detected hidden inside resource '{res_identifier}' "
+                f"({size} bytes, H={ent:.2f})! Dropper / payload evasion risk (T1027)."
+            )
+            threat_penalty += 45
+            is_suspicious = True
+            status = "EMBEDDED_PE"
+            carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
+
+        # 2. High Entropy in RT_RCDATA or Custom/Raw types
+        elif type_id == 10 or type_str == "RT_RCDATA" or not type_id:
+            if ent > 7.3 and size >= 512:
+                anomalies.append(
+                    f"Resource Anomaly: High-entropy encrypted/packed payload in resource '{res_identifier}' "
+                    f"({size} bytes, H={ent:.2f}). Second-stage dropper risk."
+                )
+                threat_penalty += 30
+                is_suspicious = True
+                status = "HIGH_ENTROPY"
+                carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
+            elif ent > 6.6 and size >= 2048:
+                status = "SUSPICIOUS"
+
+        # 3. Non-standard high entropy in other non-image resources
+        elif type_id not in (2, 3, 14, 21, 22) and ent > 7.4 and size >= 2048:
+            anomalies.append(
+                f"Resource Anomaly: Unusually high entropy in {type_str} resource '{res_identifier}' (H={ent:.2f}, {size} bytes)."
+            )
+            threat_penalty += 20
+            is_suspicious = True
+            status = "HIGH_ENTROPY"
+            carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
+
+        resources_telemetry.append(
+            {
+                "type": type_str,
+                "type_id": type_id,
+                "id": str(res_id),
+                "rva": hex(rva),
+                "size": size,
+                "size_hex": hex(size),
+                "entropy": round(ent, 2),
+                "status": status,
+                "is_suspicious": is_suspicious,
+                "is_embedded_pe": is_embedded_pe,
+            }
+        )
+
     try:
         for type_entry in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+            if entries_processed >= MAX_RSRC_ENTRIES:
+                break
             type_id = getattr(type_entry, "id", None)
             type_name = getattr(type_entry, "name", None)
             if type_name:
@@ -653,92 +743,25 @@ def inspect_pe_resources(
                 continue
 
             for name_entry in type_entry.directory.entries:
+                if entries_processed >= MAX_RSRC_ENTRIES:
+                    break
                 res_id = getattr(name_entry, "id", None) or getattr(name_entry, "name", "0")
-                res_identifier = f"{type_str}/{res_id}"
 
-                if not hasattr(name_entry, "directory") or not name_entry.directory:
-                    continue
+                if hasattr(name_entry, "directory") and name_entry.directory:
+                    for lang_entry in name_entry.directory.entries:
+                        if entries_processed >= MAX_RSRC_ENTRIES:
+                            break
+                        data_entry = getattr(lang_entry, "data", None)
+                        process_data_entry(data_entry, type_str, type_id, res_id)
+                elif hasattr(name_entry, "data") and name_entry.data:
+                    # 2-level schema tree support (D1-10)
+                    process_data_entry(name_entry.data, type_str, type_id, res_id)
 
-                for lang_entry in name_entry.directory.entries:
-                    data_entry = getattr(lang_entry, "data", None)
-                    if not data_entry or not hasattr(data_entry, "struct"):
-                        continue
-
-                    rva = getattr(data_entry.struct, "OffsetToData", 0)
-                    size = getattr(data_entry.struct, "Size", 0)
-                    if rva == 0 or size == 0:
-                        continue
-
-                    try:
-                        res_bytes = pe.get_data(rva, size)
-                    except Exception:
-                        res_bytes = b""
-
-                    if not res_bytes:
-                        continue
-
-                    ent = calculate_entropy(res_bytes)
-                    is_suspicious = False
-                    status = "OK"
-
-                    # 1. Embedded Executable Detection (Hidden PE inside resource)
-                    is_embedded_pe = False
-                    if len(res_bytes) >= 64 and res_bytes[:2] == b"MZ":
-                        try:
-                            e_lfanew = struct.unpack("<I", res_bytes[60:64])[0]
-                            if 64 <= e_lfanew <= len(res_bytes) - 4 and res_bytes[e_lfanew : e_lfanew + 4] == b"PE\x00\x00":
-                                is_embedded_pe = True
-                        except Exception:
-                            pass
-
-                    if is_embedded_pe:
-                        anomalies.append(
-                            f"Resource Steganography: Embedded PE executable detected hidden inside resource '{res_identifier}' "
-                            f"({size} bytes, H={ent:.2f})! Dropper / payload evasion risk (T1027)."
-                        )
-                        threat_penalty += 45
-                        is_suspicious = True
-                        status = "EMBEDDED_PE"
-                        carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
-
-                    # 2. High Entropy in RT_RCDATA or Custom/Raw types
-                    elif type_id == 10 or type_str == "RT_RCDATA" or not type_id:
-                        if ent > 7.3 and size >= 512:
-                            anomalies.append(
-                                f"Resource Anomaly: High-entropy encrypted/packed payload in resource '{res_identifier}' "
-                                f"({size} bytes, H={ent:.2f}). Second-stage dropper risk."
-                            )
-                            threat_penalty += 30
-                            is_suspicious = True
-                            status = "HIGH_ENTROPY"
-                            carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
-                        elif ent > 6.6 and size >= 2048:
-                            status = "SUSPICIOUS"
-
-                    # 3. Non-standard high entropy in other non-image resources
-                    elif type_id not in (2, 3, 14, 21, 22) and ent > 7.4 and size >= 2048:
-                        anomalies.append(
-                            f"Resource Anomaly: Unusually high entropy in {type_str} resource '{res_identifier}' (H={ent:.2f}, {size} bytes)."
-                        )
-                        threat_penalty += 20
-                        is_suspicious = True
-                        status = "HIGH_ENTROPY"
-                        carveable_payloads.append((f"rsrc_{type_str}_{res_id}", res_bytes, ent))
-
-                    resources_telemetry.append(
-                        {
-                            "type": type_str,
-                            "type_id": type_id,
-                            "id": str(res_id),
-                            "rva": hex(rva),
-                            "size": size,
-                            "size_hex": hex(size),
-                            "entropy": round(ent, 2),
-                            "status": status,
-                            "is_suspicious": is_suspicious,
-                            "is_embedded_pe": is_embedded_pe,
-                        }
-                    )
+        if entries_processed >= MAX_RSRC_ENTRIES:
+            anomalies.append(
+                f"Resource Limit Reached: Traversed maximum allowed {MAX_RSRC_ENTRIES} resource entries. "
+                "Potential resource exhaustion / nested tree bomb."
+            )
     except Exception:
         pass
 
@@ -777,6 +800,18 @@ def inspect_exports(
         internal_name = raw_name.decode("utf-8", errors="ignore") if raw_name else None
         symbols = getattr(exp, "symbols", []) or []
 
+        forwarded_targets = []
+        for s in symbols:
+            fwd = getattr(s, "forwarder", None)
+            if fwd:
+                if isinstance(fwd, bytes):
+                    fwd_str = fwd.decode("utf-8", errors="ignore")
+                else:
+                    fwd_str = str(fwd)
+                clean_fwd = "".join(c for c in fwd_str if c.isprintable())[:128]
+                if clean_fwd and len(forwarded_targets) < 20:
+                    forwarded_targets.append(clean_fwd)
+
         forwarded_count = sum(1 for s in symbols if getattr(s, "forwarder", None))
         total_exports = len(symbols)
 
@@ -814,6 +849,8 @@ def inspect_exports(
             "internal_name": internal_name,
             "total_exports": total_exports,
             "forwarded_count": forwarded_count,
+            "forwarded": forwarded_targets,
+            "forwarded_targets": forwarded_targets,
             "sample_exports": exported_function_names,
             "is_system_dll_name": is_system_dll_name,
         }
