@@ -154,7 +154,8 @@ def sanitize_section_name(raw_name: Any) -> str:
 
 def detect_overlapping_sections(pe: pefile.PE, file_size: int) -> Tuple[List[str], int]:
     """
-    Identifies physically overlapping sections, zero-length sections, and physical raw size anomalies.
+    Identifies physically and virtually overlapping sections, zero-length sections,
+    and physical raw size anomalies.
     
     Returns:
         (anomalies: List[str], score_penalty: int)
@@ -163,11 +164,14 @@ def detect_overlapping_sections(pe: pefile.PE, file_size: int) -> Tuple[List[str
     penalty = 0
 
     physical_spans: List[Tuple[int, int, str]] = []
+    virtual_spans: List[Tuple[int, int, str]] = []
+
     for section in pe.sections:
         name = sanitize_section_name(section.Name)
         ptr = getattr(section, "PointerToRawData", 0)
         raw_sz = getattr(section, "SizeOfRawData", 0)
         v_sz = getattr(section, "Misc_VirtualSize", 0)
+        va = getattr(section, "VirtualAddress", 0)
 
         # Zero-length section check (both virtual and raw size are zero)
         if raw_sz == 0 and v_sz == 0:
@@ -181,13 +185,23 @@ def detect_overlapping_sections(pe: pefile.PE, file_size: int) -> Tuple[List[str
             )
             penalty += 20
 
+        # Detect section mapping directly over PE headers (offset 0)
+        if ptr == 0 and raw_sz > 0:
+            anomalies.append(
+                f"Structural Anomaly: Section '{name}' has PointerToRawData=0 with SizeOfRawData > 0 (maps over PE headers, T1027 evasion risk)."
+            )
+            penalty += 25
+
         # Physical section extent [ptr, ptr + raw_sz)
         if ptr > 0 and raw_sz > 0:
             physical_spans.append((ptr, ptr + raw_sz, name))
 
+        # Virtual memory extent [va, va + v_sz)
+        if va > 0 and v_sz > 0:
+            virtual_spans.append((va, va + v_sz, name))
+
     # Sort physical spans by start offset
     physical_spans.sort(key=lambda s: s[0])
-
     for i in range(len(physical_spans)):
         start_a, end_a, name_a = physical_spans[i]
         for j in range(i + 1, len(physical_spans)):
@@ -202,7 +216,23 @@ def detect_overlapping_sections(pe: pefile.PE, file_size: int) -> Tuple[List[str
             else:
                 break
 
-    return anomalies, min(penalty, 60)
+    # Sort virtual memory spans by virtual address
+    virtual_spans.sort(key=lambda s: s[0])
+    for i in range(len(virtual_spans)):
+        va_a, end_va_a, name_a = virtual_spans[i]
+        for j in range(i + 1, len(virtual_spans)):
+            va_b, end_va_b, name_b = virtual_spans[j]
+            if va_b < end_va_a:
+                overlap_bytes = min(end_va_a, end_va_b) - va_b
+                anomalies.append(
+                    f"Structural Anomaly: Virtual section overlap detected! '{name_a}' [{hex(va_a)}-{hex(end_va_a)}] "
+                    f"overlaps with '{name_b}' [{hex(va_b)}-{hex(end_va_b)}] by {overlap_bytes} bytes in memory (T1027 evasion risk)."
+                )
+                penalty += 35
+            else:
+                break
+
+    return anomalies, min(penalty, 75)
 
 
 def detect_overlay(
@@ -275,7 +305,11 @@ def inspect_tls_callbacks(pe: pefile.PE, file_data: bytes) -> List[Dict[str, Any
             return []
 
         tls_rva = tls_dir_entry.VirtualAddress
-        is_64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
+        opt_hdr = getattr(pe, "OPTIONAL_HEADER", None)
+        is_64 = (
+            getattr(opt_hdr, "Magic", 0) == 0x020B
+            or pe.FILE_HEADER.Machine in (pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_AMD64", 0x8664), pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_ARM64", 0xAA64))
+        )
         image_base = pe.OPTIONAL_HEADER.ImageBase
 
         callbacks_va = None
@@ -308,17 +342,38 @@ def inspect_tls_callbacks(pe: pefile.PE, file_data: bytes) -> List[Dict[str, Any
         if cb_array_offset is None or cb_array_offset < 0 or cb_array_offset >= len(file_data):
             return []
 
+        # Locate enclosing section for the callback array to strictly bound traversal (D1-08)
+        array_sec_end = len(file_data)
+        for s in pe.sections:
+            if s.contains_rva(cb_array_rva):
+                ptr = getattr(s, "PointerToRawData", 0)
+                raw_sz = getattr(s, "SizeOfRawData", 0)
+                if ptr + raw_sz <= len(file_data):
+                    array_sec_end = ptr + raw_sz
+                break
+
         ptr_size = 8 if is_64 else 4
         fmt = "<Q" if is_64 else "<I"
         curr_offset = cb_array_offset
 
         for _ in range(16):
-            if curr_offset + ptr_size > len(file_data):
+            if curr_offset + ptr_size > array_sec_end:
                 break
             target_va = struct.unpack(fmt, file_data[curr_offset : curr_offset + ptr_size])[0]
             if target_va == 0:
                 break
             curr_offset += ptr_size
+
+            # Guard against negative RVA when target_va < image_base
+            if target_va < image_base:
+                cb_info = {
+                    "va": hex(target_va),
+                    "rva": "0x0",
+                    "file_offset": None,
+                    "disasm": "[Invalid target VA < ImageBase]",
+                }
+                callbacks.append(cb_info)
+                continue
 
             target_rva = target_va - image_base
             try:
@@ -409,7 +464,11 @@ def disassemble_entry_point(pe: pefile.PE, file_data: bytes) -> str:
                 if not code_bytes:
                     output_blocks.append("Empty bytes at entry point")
                 elif HAS_CAPSTONE:
-                    is_64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
+                    opt_hdr = getattr(pe, "OPTIONAL_HEADER", None)
+                    is_64 = (
+                        getattr(opt_hdr, "Magic", 0) == 0x020B
+                        or pe.FILE_HEADER.Machine in (pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_AMD64", 0x8664), pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_ARM64", 0xAA64))
+                    )
                     mode = capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
                     cs = capstone.Cs(capstone.CS_ARCH_X86, mode)
 
@@ -627,7 +686,7 @@ def inspect_pe_resources(
                     if len(res_bytes) >= 64 and res_bytes[:2] == b"MZ":
                         try:
                             e_lfanew = struct.unpack("<I", res_bytes[60:64])[0]
-                            if 0 < e_lfanew < len(res_bytes) - 4 and res_bytes[e_lfanew : e_lfanew + 4] == b"PE\x00\x00":
+                            if 64 <= e_lfanew <= len(res_bytes) - 4 and res_bytes[e_lfanew : e_lfanew + 4] == b"PE\x00\x00":
                                 is_embedded_pe = True
                         except Exception:
                             pass
