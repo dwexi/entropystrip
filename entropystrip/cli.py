@@ -9,12 +9,12 @@ import ctypes
 
 try:
     from .reporters.console import console
-    from .core import analyze_single_file, scan_directory
+    from .core import analyze_single_file, scan_directory, is_win32_reserved_name, normalize_windows_path
     from .installer import is_installed_globally, install_globally, uninstall_globally, check_existing_install
     from . import __version__
 except (ImportError, ValueError):
     from entropystrip.reporters.console import console
-    from entropystrip.core import analyze_single_file, scan_directory
+    from entropystrip.core import analyze_single_file, scan_directory, is_win32_reserved_name, normalize_windows_path
     from entropystrip.installer import is_installed_globally, install_globally, uninstall_globally, check_existing_install
     from entropystrip import __version__
 
@@ -297,7 +297,17 @@ def main() -> None:
             pause_for_user()
         sys.exit(0)
 
-    clean_target = os.path.abspath(os.path.normpath(args.target.strip().strip('"\'')))
+    raw_target = args.target.strip().strip('"\'')
+    if sys.platform == "win32" and is_win32_reserved_name(raw_target):
+        console.print(
+            f"[bold red]Error: Target '{raw_target}' is a reserved Win32 device name "
+            f"(CON, PRN, AUX, NUL, COM1-9, LPT1-9).[/bold red]"
+        )
+        if is_explorer_launched():
+            pause_for_user()
+        sys.exit(1)
+
+    clean_target = normalize_windows_path(os.path.abspath(os.path.normpath(raw_target)))
 
     if os.path.isdir(clean_target):
         scan_directory(

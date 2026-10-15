@@ -7,16 +7,24 @@ from typing import List, Tuple, Dict, Any, Optional
 
 # Sampling limit for massive sections/overlays to keep triage instantaneous
 LARGE_BUFFER_SAMPLE_LIMIT = 1_000_000
-SAMPLE_HEAD_TAIL = 500_000
+SAMPLE_CHUNK_SIZE = 200_000
+SAMPLE_NUM_CHUNKS = 5
 
 
 def sample_large_buffer(data: bytes) -> bytes:
     """
-    Samples head and tail on multi-megabyte buffers to prevent latency degradation
-    during initial triage passes.
+    Strided multi-chunk sampling across multi-megabyte buffers.
+    Extracts 5 equidistant 200KB chunks (head, interior strides, and tail) to prevent latency
+    degradation while eliminating central payload evasion blind spots (D2-06).
     """
-    if len(data) > LARGE_BUFFER_SAMPLE_LIMIT:
-        return data[:SAMPLE_HEAD_TAIL] + data[-SAMPLE_HEAD_TAIL:]
+    total_len = len(data)
+    if total_len > LARGE_BUFFER_SAMPLE_LIMIT:
+        stride = (total_len - SAMPLE_CHUNK_SIZE) // (SAMPLE_NUM_CHUNKS - 1)
+        chunks = []
+        for i in range(SAMPLE_NUM_CHUNKS):
+            offset = min(total_len - SAMPLE_CHUNK_SIZE, i * stride)
+            chunks.append(data[offset : offset + SAMPLE_CHUNK_SIZE])
+        return b"".join(chunks)
     return data
 
 

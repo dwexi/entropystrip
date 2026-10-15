@@ -5,6 +5,7 @@ Core analysis coordinator and public API facade for EntropyStrip.
 import os
 import sys
 import json
+import math
 import struct
 import hashlib
 from typing import Optional, Dict, Any, List, Tuple
@@ -95,18 +96,72 @@ __all__ = [
 ]
 
 
+WIN32_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+
+def is_win32_reserved_name(p: str) -> bool:
+    """Returns True if the basename or file stem matches a Win32 reserved device name."""
+    if not p:
+        return False
+    clean = p.strip().strip('"\'')
+    base = os.path.basename(clean)
+    stem = base.split(".")[0].upper()
+    return stem in WIN32_RESERVED_NAMES
+
+
 def normalize_windows_path(p: str) -> str:
-    """Normalizes path and prepends extended-length \\\\?\\ prefix on Windows if path exceeds 240 chars."""
+    """Normalizes path and prepends extended-length \\\\?\\ or \\\\?\\UNC\\ prefix on Windows."""
     if not p:
         return p
     clean = p.strip().strip('"\'')
+    if sys.platform == "win32" and is_win32_reserved_name(clean):
+        return clean
     try:
         norm = os.path.normpath(os.path.abspath(clean))
-        if sys.platform == "win32" and not norm.startswith("\\\\?\\") and len(norm) >= 240:
-            return f"\\\\?\\{norm}"
+        if sys.platform == "win32" and len(norm) >= 240:
+            if norm.startswith("\\\\?\\UNC\\") or (norm.startswith("\\\\?\\") and not norm.startswith("\\\\?\\\\")):
+                return norm
+            if norm.startswith("\\\\"):
+                # Extended UNC format: \\?\UNC\server\share
+                return f"\\\\?\\UNC\\{norm[2:]}"
+            elif not norm.startswith("\\\\?\\"):
+                return f"\\\\?\\{norm}"
         return norm
     except Exception:
         return clean
+
+
+def safe_json_default(obj: Any) -> Any:
+    """Safe fallback serializer for bytes, non-finite floats, and custom objects."""
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    return str(obj)
+
+
+def sanitize_json_surrogates(obj: Any) -> Any:
+    """Replaces lone Unicode surrogate characters, bytes, and non-finite floats before JSON encoding."""
+    if isinstance(obj, str):
+        return obj.encode("utf-8", errors="replace").decode("utf-8")
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+    elif isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+    elif isinstance(obj, dict):
+        return {sanitize_json_surrogates(k): sanitize_json_surrogates(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_json_surrogates(elem) for elem in obj]
+    return obj
 
 
 def analyze_single_file(
@@ -122,17 +177,48 @@ def analyze_single_file(
     bazaar_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Analyzes a single PE binary for obfuscation, high entropy, and evasion heuristics."""
+    if sys.platform == "win32" and is_win32_reserved_name(file_path):
+        if not quiet:
+            console.print(
+                f"[bold red]Error: Target '{escape(file_path)}' is a reserved Win32 device name "
+                f"(CON, PRN, AUX, NUL, COM1-9, LPT1-9).[/bold red]"
+            )
+        return None
+
     norm_path = normalize_windows_path(file_path)
     if not os.path.exists(norm_path):
         if not quiet:
-            console.print(f"[red]Error: File not found -> {file_path}[/red]")
+            console.print(f"[red]Error: File not found -> {escape(file_path)}[/red]")
         return None
 
     try:
         file_size = os.path.getsize(norm_path)
+    except PermissionError as perm_err:
+        if not quiet:
+            console.print(f"[bold yellow][!] File Locked (Active Process): {escape(os.path.basename(file_path))}[/bold yellow]")
+        f_hashes = compute_hashes(b"")
+        diagnostic = TriageDiagnostic(
+            filename=os.path.basename(file_path),
+            path=file_path,
+            hashes=f_hashes,
+            imphash=None,
+            fuzzy_hash=None,
+            threat_score=60,
+            verdict="[WARNING] Locked by Active Process (OS Sharing Lock)",
+            color="bold yellow",
+            is_dotnet=False,
+            is_signed=False,
+            has_overlay=False,
+            overlay_size=0,
+            total_imports=0,
+            anomalies=[f"Active Process Lock: Binary exclusively locked by running OS process ({perm_err}). Potential active malware defense."],
+            mitre=[("T1055", "Process Injection", "Process active / locked executable on disk")],
+            sections=[],
+        )
+        return diagnostic.to_dict()
     except Exception as e:
         if not quiet:
-            console.print(f"[dim]Cannot access {os.path.basename(file_path)}: {e}[/dim]")
+            console.print(f"[dim]Cannot access {escape(os.path.basename(file_path))}: {e}[/dim]")
         return None
 
     is_large_file = file_size > 16 * 1024 * 1024
@@ -140,18 +226,42 @@ def analyze_single_file(
     pe = None
 
     try:
-        if not is_large_file:
-            with open(norm_path, "rb") as f:
-                file_data = f.read()
-        else:
-            with open(norm_path, "rb") as f:
-                file_data = f.read(2 * 1024 * 1024)
+        try:
+            if not is_large_file:
+                with open(norm_path, "rb") as f:
+                    file_data = f.read()
+            else:
+                with open(norm_path, "rb") as f:
+                    file_data = f.read(2 * 1024 * 1024)
+        except PermissionError as perm_err:
+            if not quiet:
+                console.print(f"[bold yellow][!] File Locked (Active Process): {escape(os.path.basename(file_path))}[/bold yellow]")
+            f_hashes = compute_hashes(b"")
+            diagnostic = TriageDiagnostic(
+                filename=os.path.basename(file_path),
+                path=file_path,
+                hashes=f_hashes,
+                imphash=None,
+                fuzzy_hash=None,
+                threat_score=60,
+                verdict="[WARNING] Locked by Active Process (OS Sharing Lock)",
+                color="bold yellow",
+                is_dotnet=False,
+                is_signed=False,
+                has_overlay=False,
+                overlay_size=0,
+                total_imports=0,
+                anomalies=[f"Active Process Lock: Binary exclusively locked by running OS process ({perm_err}). Potential active malware defense."],
+                mitre=[("T1055", "Process Injection", "Process active / locked executable on disk")],
+                sections=[],
+            )
+            return diagnostic.to_dict()
 
         # Clean rejection of non-PE formats (e.g. Linux ELF)
         if file_data[:4] == b"\x7fELF":
             if not quiet:
                 console.print(
-                    f"[yellow][!] Unsupported format: Linux ELF binary ({os.path.basename(file_path)}). "
+                    f"[yellow][!] Unsupported format: Linux ELF binary ({escape(os.path.basename(file_path))}). "
                     f"EntropyStrip is purpose-built for Windows PE32/PE32+ executables.[/yellow]"
                 )
             return None
@@ -715,7 +825,8 @@ def analyze_single_file(
             bazaar_intel = query_malware_bazaar(sha256_hash, api_key=bazaar_key)
             if bazaar_intel and bazaar_intel.get("status") == "malicious":
                 fam = bazaar_intel.get("signature") or "Known Threat"
-                tg = ", ".join(bazaar_intel.get("tags", []))
+                raw_tags = bazaar_intel.get("tags") or []
+                tg = ", ".join(str(t) for t in raw_tags if t is not None)
                 tg_str = f" (Tags: {tg})" if tg else ""
                 anomalies.append(f"MalwareBazaar Threat Intelligence: Confirmed malicious sample! Family: '{fam}'{tg_str}")
                 threat_score += 45
@@ -874,6 +985,7 @@ def analyze_single_file(
         exports_info=exp_info,
         resources_info=rsrc_telemetry,
     )
+
     telemetry_data = diagnostic.to_dict()
 
     if json_out:
@@ -881,14 +993,15 @@ def analyze_single_file(
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
         with open(json_out, "w", encoding="utf-8") as f:
-            json.dump(telemetry_data, f, indent=2)
+            sanitized = sanitize_json_surrogates(telemetry_data)
+            json.dump(sanitized, f, indent=2, default=safe_json_default)
         if not quiet:
-            console.print(f"[green][+] JSON telemetry written:[/green] {os.path.abspath(json_out)}")
+            console.print(f"[green][+] JSON telemetry written:[/green] {escape(os.path.abspath(json_out))}")
 
     if html_out:
         generate_html_report(telemetry_data, html_out)
         if not quiet:
-            console.print(f"[green][+] HTML report generated:[/green] {os.path.abspath(html_out)}")
+            console.print(f"[green][+] HTML report generated:[/green] {escape(os.path.abspath(html_out))}")
 
     return telemetry_data
 
@@ -908,13 +1021,13 @@ def scan_directory(
     """Walks directory, ranks found binaries on incident triage leaderboard, and exports HTML/JSON reports."""
     norm_dir = normalize_windows_path(dir_path)
     if not os.path.isdir(norm_dir):
-        console.print(f"[red]Error: Directory not found -> {dir_path}[/red]")
+        console.print(f"[red]Error: Directory not found -> {escape(dir_path)}[/red]")
         return []
 
-    console.print(f"\n[bold magenta][*] Scanning Directory:[/bold magenta] {dir_path}")
+    console.print(f"\n[bold magenta][*] Scanning Directory:[/bold magenta] {escape(dir_path)}")
     if enable_yara or yara_rule_path is not None:
         rule_desc = os.path.basename(yara_rule_path) if (yara_rule_path and yara_rule_path != "__default__") else "bundled threats.yar"
-        console.print(f"[dim]  • YARA Engine: Active (Scanning with {rule_desc})[/dim]")
+        console.print(f"[dim]  • YARA Engine: Active (Scanning with {escape(rule_desc)})[/dim]")
     if enable_bazaar:
         console.print("[dim]  • Threat Intel: Active (Querying MalwareBazaar abuse.ch API)[/dim]")
 
@@ -926,22 +1039,23 @@ def scan_directory(
         visited_dirs = set()
         for root, dirs, files in os.walk(norm_dir, followlinks=False):
             try:
-                real_root = os.path.realpath(root)
+                real_root = os.path.realpath(root).lower()
             except Exception:
-                real_root = root
+                real_root = root.lower()
 
             if real_root in visited_dirs:
                 dirs.clear()
                 continue
             visited_dirs.add(real_root)
 
-            # Prevent traversing circular junction loops or reparse points
+            # Prevent traversing circular junction loops or reparse points (D3-10)
             pruned_dirs = []
             for d in dirs:
                 sub_path = os.path.join(root, d)
                 try:
-                    real_sub = os.path.realpath(sub_path)
-                    if real_sub in visited_dirs or (sys.platform == "win32" and os.path.islink(sub_path)):
+                    real_sub = os.path.realpath(sub_path).lower()
+                    is_junction = getattr(os.path, "isjunction", lambda p: False)(sub_path)
+                    if real_sub in visited_dirs or is_junction or os.path.islink(sub_path):
                         continue
                     pruned_dirs.append(d)
                 except Exception:
@@ -965,11 +1079,18 @@ def scan_directory(
                         if res:
                             results.append(res)
                     except PermissionError:
-                        console.print(f"[dim]Permission denied: {os.path.basename(full_p)}[/dim]")
+                        console.print(f"[dim]Permission denied: {escape(os.path.basename(full_p))}[/dim]")
                     except Exception as e:
-                        console.print(f"[dim]Skipping {os.path.basename(full_p)}: {e}[/dim]")
+                        console.print(f"[dim]Skipping {escape(os.path.basename(full_p))}: {escape(str(e))}[/dim]")
     else:
-        for item in os.listdir(norm_dir):
+        # Non-recursive directory listing guarded against permission/OS errors (D3-09)
+        try:
+            items = os.listdir(norm_dir)
+        except (PermissionError, OSError) as dir_err:
+            console.print(f"[bold red]Error: Cannot list directory '{escape(dir_path)}': {escape(str(dir_err))}[/bold red]")
+            return []
+
+        for item in items:
             full_p = os.path.join(norm_dir, item)
             try:
                 if os.path.isfile(full_p) and any(item.lower().endswith(ext) for ext in target_extensions):
@@ -986,9 +1107,9 @@ def scan_directory(
                     if res:
                         results.append(res)
             except PermissionError:
-                console.print(f"[dim]Permission denied: {os.path.basename(full_p)}[/dim]")
+                console.print(f"[dim]Permission denied: {escape(os.path.basename(full_p))}[/dim]")
             except Exception as e:
-                console.print(f"[dim]Skipping {os.path.basename(full_p)}: {e}[/dim]")
+                console.print(f"[dim]Skipping {escape(os.path.basename(full_p))}: {escape(str(e))}[/dim]")
 
     if not results:
         console.print("[dim]No Windows PE binaries found in directory.[/dim]")
@@ -1026,8 +1147,9 @@ def scan_directory(
             "results": results,
         }
         with open(json_out, "w", encoding="utf-8") as f:
-            json.dump(directory_telemetry, f, indent=2)
-        console.print(f"[green][+] JSON telemetry written:[/green] {os.path.abspath(json_out)}")
+            sanitized = sanitize_json_surrogates(directory_telemetry)
+            json.dump(sanitized, f, indent=2, default=safe_json_default)
+        console.print(f"[green][+] JSON telemetry written:[/green] {escape(os.path.abspath(json_out))}")
 
     if html_out:
         generate_directory_html_report(
@@ -1037,6 +1159,6 @@ def scan_directory(
             yara_enabled=(enable_yara or yara_rule_path is not None),
             bazaar_enabled=enable_bazaar,
         )
-        console.print(f"[green][+] HTML report generated:[/green] {os.path.abspath(html_out)}")
+        console.print(f"[green][+] HTML report generated:[/green] {escape(os.path.abspath(html_out))}")
 
     return results

@@ -2,6 +2,7 @@
 Rich terminal UI rendering: section architecture tables, heatmaps, and diagnostic panels.
 """
 
+import re
 from typing import List, Dict, Any, Optional, Tuple
 from rich.console import Console
 from rich.table import Table
@@ -9,6 +10,17 @@ from rich.panel import Panel
 from rich.markup import escape
 
 console = Console()
+
+ANSI_REGEX = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def strip_ansi(text: Any) -> str:
+    """Removes VT100/ANSI escape codes from external untrusted strings (D5-07)."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return ANSI_REGEX.sub("", text)
 
 
 def render_console_report(
@@ -34,27 +46,27 @@ def render_console_report(
     exports_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Renders comprehensive CLI triage dashboard."""
-    console.print(f"\n[bold]Target:[/bold] {escape(target_path)}")
+    console.print(f"\n[bold]Target:[/bold] {escape(strip_ansi(target_path))}")
     if deep and hashes:
-        console.print(f"[dim]SHA256: {escape(str(hashes.get('sha256', '-')))}[/dim]")
+        console.print(f"[dim]SHA256: {escape(strip_ansi(str(hashes.get('sha256', '-'))))}[/dim]")
         if imphash_val:
-            console.print(f"[dim]Imphash: {escape(str(imphash_val))}[/dim]")
+            console.print(f"[dim]Imphash: {escape(strip_ansi(str(imphash_val)))}[/dim]")
         if fuzzy_hash:
-            console.print(f"[dim]SSDEEP:  {escape(str(fuzzy_hash))}[/dim]")
+            console.print(f"[dim]SSDEEP:  {escape(strip_ansi(str(fuzzy_hash)))}[/dim]")
 
     console.print(sections_table)
 
     score_panel_text = (
         f"[bold {verdict_color}]Score: {threat_score}/100[/bold {verdict_color}]\n"
-        f"[bold]Verdict:[/bold] [{verdict_color}]{escape(verdict_text)}[/{verdict_color}]\n"
+        f"[bold]Verdict:[/bold] [{verdict_color}]{escape(strip_ansi(verdict_text))}[/{verdict_color}]\n"
         f"[bold]Format:[/bold] {'Managed (.NET)' if is_dotnet else 'Native PE'} | "
         f"[bold]Signature:[/bold] {'Signed' if is_signed else 'Unsigned'}\n\n"
         f"[underline]Findings:[/underline]\n"
-        + ("\n".join([f"• [{verdict_color}]{escape(a)}[/{verdict_color}]" for a in anomalies]) if anomalies else "• Clean structure.")
+        + ("\n".join([f"• [{verdict_color}]{escape(strip_ansi(a))}[/{verdict_color}]" for a in anomalies]) if anomalies else "• Clean structure.")
     )
     if indicators:
         score_panel_text += "\n\n[underline]Extracted Indicators:[/underline]\n" + "\n".join(
-            [f"• [cyan]{escape(ind)}[/cyan]" for ind in indicators]
+            [f"• [cyan]{escape(strip_ansi(ind))}[/cyan]" for ind in indicators]
         )
 
     console.print("\n", Panel(score_panel_text, title="Triage Diagnostic", border_style=verdict_color))
@@ -62,11 +74,13 @@ def render_console_report(
     # MalwareBazaar Threat Intel Panel
     if bazaar_intel:
         if bazaar_intel.get("status") == "malicious":
+            raw_tags = bazaar_intel.get("tags") or []
+            tags_str = ", ".join(str(t) for t in raw_tags if t is not None)
             bazaar_text = (
-                f"[bold red]Malware Signature:[/bold red] {escape(str(bazaar_intel.get('signature', 'Unknown Threat')))}\n"
-                f"[bold]Tags:[/bold] {escape(', '.join(bazaar_intel.get('tags', [])))}\n"
-                f"[bold]First Seen:[/bold] {escape(str(bazaar_intel.get('first_seen', '-')))} | "
-                f"[bold]Reporter:[/bold] @{escape(str(bazaar_intel.get('reporter', '-')))}"
+                f"[bold red]Malware Signature:[/bold red] {escape(strip_ansi(str(bazaar_intel.get('signature', 'Unknown Threat'))))}\n"
+                f"[bold]Tags:[/bold] {escape(strip_ansi(tags_str))}\n"
+                f"[bold]First Seen:[/bold] {escape(strip_ansi(str(bazaar_intel.get('first_seen', '-'))))} | "
+                f"[bold]Reporter:[/bold] @{escape(strip_ansi(str(bazaar_intel.get('reporter', '-'))))}"
             )
             vt = bazaar_intel.get("virustotal")
             if vt and vt.get("percent") is not None:
@@ -189,15 +203,15 @@ def render_triage_leaderboard(
 
     for idx, r in enumerate(results, 1):
         score_str = f"[{r['color']}]{r['threat_score']}[/{r['color']}]"
-        verdict_str = f"[{r['color']}]{escape(r['verdict'])}[/{r['color']}]"
+        verdict_str = f"[{r['color']}]{escape(strip_ansi(r['verdict']))}[/{r['color']}]"
         wx_str = "[bold red]YES[/bold red]" if r.get("wx") else "[dim]NO[/dim]"
         dotnet_str = "[cyan]YES[/cyan]" if r.get("is_dotnet") else "[dim]NO[/dim]"
         overlay_str = "[bold red]YES[/bold red]" if r.get("has_overlay") else "[dim]NO[/dim]"
-        top_anomaly = escape(r["anomalies"][0]) if r.get("anomalies") else "None"
+        top_anomaly = escape(strip_ansi(r["anomalies"][0])) if r.get("anomalies") else "None"
 
         triage_table.add_row(
             str(idx),
-            escape(r["filename"]),
+            escape(strip_ansi(r["filename"])),
             score_str,
             wx_str,
             dotnet_str,
@@ -211,8 +225,8 @@ def render_triage_leaderboard(
     if clusters:
         console.print("\n[bold cyan]Automated Campaign Clusters (Fuzzy Hash Similarity >= 70%):[/bold cyan]")
         for c_name, members in clusters.items():
-            names = ", ".join([escape(m["filename"]) for m in members])
-            console.print(f"  • [bold magenta]{escape(str(c_name))}[/bold magenta] ({len(members)} binaries): [dim]{names}[/dim]")
+            names = ", ".join([escape(strip_ansi(m["filename"])) for m in members])
+            console.print(f"  • [bold magenta]{escape(strip_ansi(str(c_name)))}[/bold magenta] ({len(members)} binaries): [dim]{names}[/dim]")
 
     console.print(f"\n[green][+] Completed:[/green] Triaged {len(results)} binaries.")
 
