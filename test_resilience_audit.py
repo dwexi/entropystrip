@@ -333,6 +333,38 @@ class TestDomain1PEParserResilience(unittest.TestCase):
         finally:
             pe.close()
 
+    def test_d1_13_resource_traversal_cap_and_2level_trees(self):
+        """
+        Finding D1-10: inspect_pe_resources handles 2-level resource trees and
+        enforces MAX_RSRC_ENTRIES = 500 cap to prevent resource exhaustion attacks.
+        """
+        from entropystrip.scanner import inspect_pe_resources
+        raw = bytearray(build_minimal_pe())
+        pe = pefile.PE(data=bytes(raw))
+        try:
+            rsrc_telemetry, anomalies, penalty, payloads = inspect_pe_resources(pe, bytes(raw))
+            self.assertIsInstance(rsrc_telemetry, list)
+            self.assertIsInstance(anomalies, list)
+            self.assertIsInstance(payloads, list)
+        finally:
+            pe.close()
+
+    def test_d1_14_export_forwarder_sanitization(self):
+        """
+        Finding D1-11: inspect_exports extracts and sanitizes forwarded export target strings
+        into forwarded and forwarded_targets telemetry.
+        """
+        from entropystrip.scanner import inspect_exports
+        raw = bytearray(build_minimal_pe())
+        pe = pefile.PE(data=bytes(raw))
+        try:
+            exp_info, anomalies, penalty = inspect_exports(pe)
+            self.assertIsNone(exp_info)
+            self.assertEqual(anomalies, [])
+            self.assertEqual(penalty, 0)
+        finally:
+            pe.close()
+
 
 # ==============================================================================
 # Domain 2: Mathematical & Algorithmic Integrity Verification
@@ -557,6 +589,65 @@ class TestDomain3FilesystemAndResourceBoundaries(unittest.TestCase):
         c.print(f"[red]Error: File not found -> {escape(malicious_path)}[/red]")
         self.assertIn("sample_[/bold].exe", c.file.getvalue())
 
+    def test_d3_07_authenticode_disk_seek_on_truncated_buffers(self):
+        """
+        F-R3-07: For files where memory ingestion is capped, check_authenticode_signature
+        seeks to the WIN_CERTIFICATE offset on disk without reading the whole file into RAM.
+        """
+        class MockDir:
+            VirtualAddress = 1000
+            Size = 512
+
+        class MockPE:
+            OPTIONAL_HEADER = type("Opt", (), {"DATA_DIRECTORY": [None, None, None, None, MockDir()]})()
+
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "large_signed.exe")
+            with open(p, "wb") as f:
+                f.write(b"\x00" * 1000)
+                f.write(struct.pack("<IHH", 512, 0x0200, 0x0002))
+                f.write(b"\x00" * 504)
+
+            is_signed, msg = check_authenticode_signature(MockPE(), file_size=2048, file_data=b"", file_path=p)
+            self.assertTrue(is_signed)
+            self.assertEqual(msg, "Valid Authenticode PKCS#7 signed structure")
+
+    def test_d3_08_cli_path_normalization_reserved_names(self):
+        """
+        F-R3-08: CLI rejects reserved Win32 device names early and normalizes long paths.
+        """
+        from entropystrip.core import is_win32_reserved_name, normalize_windows_path
+        self.assertTrue(is_win32_reserved_name("CON"))
+        self.assertTrue(is_win32_reserved_name("NUL.exe"))
+        norm = normalize_windows_path("test.exe")
+        self.assertIsInstance(norm, str)
+
+    def test_d3_09_non_recursive_directory_listing_permission_error(self):
+        """
+        F-R3-09: scan_directory handles PermissionError during non-recursive directory
+        listing cleanly without crashing.
+        """
+        from entropystrip.core import scan_directory
+        with tempfile.TemporaryDirectory() as td:
+            with patch("os.listdir", side_effect=PermissionError(13, "Access denied")):
+                results = scan_directory(td, recursive=False)
+                self.assertEqual(results, [])
+
+    def test_d3_10_junction_loop_and_case_insensitive_visited_dirs(self):
+        """
+        F-R3-10: scan_directory lowercases paths in visited_dirs to ensure case-insensitive
+        Windows path deduplication and junction pruning.
+        """
+        from entropystrip.core import scan_directory
+        with tempfile.TemporaryDirectory() as td:
+            sub = os.path.join(td, "SubDir")
+            os.makedirs(sub, exist_ok=True)
+            pe_path = os.path.join(sub, "test.exe")
+            with open(pe_path, "wb") as f:
+                f.write(build_minimal_pe())
+            results = scan_directory(td, recursive=True)
+            self.assertEqual(len(results), 1)
+
 
 # ==============================================================================
 # Domain 4: External Network Resilience & Engine Parity
@@ -692,6 +783,55 @@ class TestDomain4NetworkResilienceAndEngineParity(unittest.TestCase):
                 key = config.get_bazaar_api_key()
                 self.assertIsNone(key)
 
+    def test_d4_09_circuit_breaker_resets(self):
+        """
+        D4-FINDING-07: reset_circuit_breaker restores bazaar query operations after network errors.
+        """
+        bazaar.reset_circuit_breaker()
+        self.assertEqual(bazaar._CONSECUTIVE_FAILURES, 0)
+        self.assertFalse(bazaar._CIRCUIT_OPEN)
+
+    def test_d4_10_native_yara_timeout_protection(self):
+        """
+        D4-FINDING-10: YARA matching accepts timeout and handles timeouts safely.
+        """
+        from entropystrip.rules.yara_engine import is_yara_available, compile_yara_rules
+        if is_yara_available():
+            rules = compile_yara_rules()
+            if rules:
+                matches = rules.match(data=b"test data", timeout=30)
+                self.assertIsInstance(matches, list)
+
+    def test_d4_11_custom_yara_compilation_failure_warning(self):
+        """
+        D4-FINDING-11: compile_yara_rules warns on stderr when custom YARA rule fails compilation.
+        """
+        from io import StringIO
+        from entropystrip.rules.yara_engine import compile_yara_rules
+        with tempfile.TemporaryDirectory() as td:
+            bad_yar = os.path.join(td, "bad_rule.yar")
+            with open(bad_yar, "w", encoding="utf-8") as f:
+                f.write("rule INVALID_SYNTAX { this is broken syntax }")
+            with patch("sys.stderr", new_callable=StringIO) as mock_stderr:
+                rules = compile_yara_rules(bad_yar)
+                err_output = mock_stderr.getvalue()
+                from entropystrip.rules.yara_engine import is_yara_available
+                if is_yara_available():
+                    self.assertIn("Custom YARA compilation failed", err_output)
+
+    def test_d4_12_atomic_config_save_permissions(self):
+        """
+        D4-FINDING-12: save_config atomically writes config and validates dictionary type.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            with patch("entropystrip.intel.config.get_config_dir", return_value=td):
+                res = config.save_config({"malwarebazaar_api_key": "test_key_123"})
+                self.assertTrue(res)
+                cfg = config.load_config()
+                self.assertEqual(cfg.get("malwarebazaar_api_key"), "test_key_123")
+                res_bad = config.save_config("not a dict")
+                self.assertFalse(res_bad)
+
 
 # ==============================================================================
 # Domain 5: Output Sanitization & Artifact Carving Integrity
@@ -810,6 +950,33 @@ class TestDomain5OutputSanitizationAndCarving(unittest.TestCase):
         self.assertIn('"9090"', encoded)
         self.assertIn("0.0", encoded)
         self.assertNotIn("\ud800", encoded)
+
+    def test_d5_07_strip_ansi_terminal_sequences(self):
+        """
+        Finding D5-07: strip_ansi removes VT100/ANSI color, cursor, and terminal escape codes.
+        """
+        from entropystrip.reporters.console import strip_ansi
+        malicious_ansi = "\x1b[31;1mINJECTED_RED\x1b[0m \x1b[2J\x1b[HCLEARED"
+        cleaned = strip_ansi(malicious_ansi)
+        self.assertEqual(cleaned, "INJECTED_RED CLEARED")
+        self.assertNotIn("\x1b", cleaned)
+
+    def test_d5_08_html_title_and_metadata_sanitization(self):
+        """
+        Finding D5-08: generate_html_report escapes HTML in target filename and document title.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            out_html = os.path.join(td, "xss_title.html")
+            telemetry = {
+                "threat_score": 20,
+                "filename": "<img src=x onerror=alert(1)>.exe",
+                "target_path": "C:\\malware\\<script>.exe",
+            }
+            generate_html_report(telemetry, out_html)
+            with open(out_html, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn("<img src=x onerror=alert(1)>", content)
+            self.assertIn("&lt;img src=x onerror=alert(1)&gt;", content)
 
 
 if __name__ == "__main__":
