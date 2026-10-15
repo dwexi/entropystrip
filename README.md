@@ -115,7 +115,7 @@ entropystrip suspicious.exe --deep
 ```bash
 entropystrip suspicious.exe --dump
 ```
-Carved payloads are written to `extracted_payloads/<sha>_<target>_<section>.bin`.
+Carved payloads are written to `extracted_payloads/payload_<sha256>_sec<index>_<section>.bin`.
 
 **Export a standalone HTML report:**
 ```bash
