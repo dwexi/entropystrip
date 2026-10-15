@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Safe handling of `None` VirusTotal ratios in HTML report generation.
 - Safe string coercion for tags lists to avoid `TypeError` on unexpected API output.
 - Config parser dictionary validation so corrupted or list-based JSON files return an empty dictionary instead of throwing `AttributeError`.
+- Entry point and TLS callback disassembly fall back to `pe.get_data` when physical file offsets exceed the initial buffer slice on large binaries.
+- ARM64 disassembly mode set to `CS_ARCH_ARM64` and `CS_MODE_ARM` in Capstone, correcting instruction decoding on 64-bit ARM Windows binaries.
+- System32 DLL masquerade detection verifies the directory path boundary against the real Windows directory, blocking path bypasses from deceptive subdirectories.
+- Reserved Win32 device name filtering strips trailing spaces and periods, blocking filesystem evasions like `NUL.` or `CON `.
+- Pure-Python fallback YARA engine reads up to 16 MB directly from disk for large binaries, catching threat signatures located in overlays and tail sections.
 
 ### Security
 - Stored XSS defense in HTML reports: properly escaped masqueraded DLL names, binary paths, hashes, and document titles.

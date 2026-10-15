@@ -390,16 +390,27 @@ def inspect_tls_callbacks(pe: pefile.PE, file_data: bytes) -> List[Dict[str, Any
 
             if target_file_offset is not None and 0 <= target_file_offset < len(file_data):
                 code_bytes = file_data[target_file_offset : target_file_offset + 32]
-                if HAS_CAPSTONE and code_bytes:
-                    mode = capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
-                    cs = capstone.Cs(capstone.CS_ARCH_X86, mode)
+            else:
+                try:
+                    code_bytes = pe.get_data(target_rva, 32)
+                except Exception:
+                    code_bytes = b""
+
+            if code_bytes:
+                if HAS_CAPSTONE:
+                    is_arm64 = getattr(getattr(pe, "FILE_HEADER", None), "Machine", 0) == pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_ARM64", 0xAA64)
+                    if is_arm64:
+                        cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+                    else:
+                        mode = capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
+                        cs = capstone.Cs(capstone.CS_ARCH_X86, mode)
                     lines = []
                     for ins in cs.disasm(code_bytes, target_va):
                         lines.append(f"{hex(ins.address):<10} {ins.mnemonic:<7} {ins.op_str}")
                         if len(lines) >= 6:
                             break
                     cb_info["disasm"] = "\n".join(lines) if lines else code_bytes.hex(" ")
-                elif code_bytes:
+                else:
                     cb_info["disasm"] = " ".join([f"{b:02x}" for b in code_bytes[:16]])
             else:
                 cb_info["disasm"] = "[Target VA outside mapped section]"
@@ -456,32 +467,46 @@ def disassemble_entry_point(pe: pefile.PE, file_data: bytes) -> str:
         if ep_rva == 0:
             output_blocks.append("No execution entry point (DLL resource/pure data)")
         else:
-            ep_offset = pe.get_offset_from_rva(ep_rva)
-            if ep_offset is None or ep_offset < 0 or ep_offset >= len(file_data):
-                output_blocks.append(f"Entry point points outside file (RVA: {hex(ep_rva)} - Header anomaly)")
-            else:
-                code_bytes = file_data[ep_offset : ep_offset + 32]
-                if not code_bytes:
+            code_bytes = b""
+            try:
+                code_bytes = pe.get_data(ep_rva, 32)
+            except Exception:
+                pass
+
+            if not code_bytes:
+                ep_offset = pe.get_offset_from_rva(ep_rva)
+                if ep_offset is not None and 0 <= ep_offset < len(file_data):
+                    code_bytes = file_data[ep_offset : ep_offset + 32]
+
+            if not code_bytes:
+                ep_offset = pe.get_offset_from_rva(ep_rva)
+                if ep_offset is None or ep_offset < 0:
+                    output_blocks.append(f"Entry point points outside file (RVA: {hex(ep_rva)} - Header anomaly)")
+                else:
                     output_blocks.append("Empty bytes at entry point")
-                elif HAS_CAPSTONE:
-                    opt_hdr = getattr(pe, "OPTIONAL_HEADER", None)
+            elif HAS_CAPSTONE:
+                opt_hdr = getattr(pe, "OPTIONAL_HEADER", None)
+                is_arm64 = getattr(getattr(pe, "FILE_HEADER", None), "Machine", 0) == pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_ARM64", 0xAA64)
+                if is_arm64:
+                    cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+                else:
                     is_64 = (
                         getattr(opt_hdr, "Magic", 0) == 0x020B
-                        or pe.FILE_HEADER.Machine in (pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_AMD64", 0x8664), pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_ARM64", 0xAA64))
+                        or pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE.get("IMAGE_FILE_MACHINE_AMD64", 0x8664)
                     )
                     mode = capstone.CS_MODE_64 if is_64 else capstone.CS_MODE_32
                     cs = capstone.Cs(capstone.CS_ARCH_X86, mode)
 
-                    lines = []
-                    for ins in cs.disasm(code_bytes, ep_rva):
-                        lines.append(f"{hex(ins.address):<10} {ins.mnemonic:<7} {ins.op_str}")
-                        if len(lines) >= 8:
-                            break
-                    ep_text = "\n".join(lines) if lines else code_bytes.hex(" ")
-                    output_blocks.append(f"[Main Entry Point (RVA: {hex(ep_rva)})]:\n{ep_text}")
-                else:
-                    hex_str = " ".join([f"{b:02x}" for b in code_bytes[:24]])
-                    output_blocks.append(f"[Main Entry Point (RVA: {hex(ep_rva)})]: {hex_str} (install 'capstone' for full disassembly)")
+                lines = []
+                for ins in cs.disasm(code_bytes, ep_rva):
+                    lines.append(f"{hex(ins.address):<10} {ins.mnemonic:<7} {ins.op_str}")
+                    if len(lines) >= 8:
+                        break
+                ep_text = "\n".join(lines) if lines else code_bytes.hex(" ")
+                output_blocks.append(f"[Main Entry Point (RVA: {hex(ep_rva)})]:\n{ep_text}")
+            else:
+                hex_str = " ".join([f"{b:02x}" for b in code_bytes[:24]])
+                output_blocks.append(f"[Main Entry Point (RVA: {hex(ep_rva)})]: {hex_str} (install 'capstone' for full disassembly)")
     except Exception as e:
         output_blocks.append(f"Disassembly unavailable: {e}")
 
@@ -837,7 +862,15 @@ def inspect_exports(
         if is_system_dll_name:
             # Check if file resides in legitimate System32 directory
             norm_p = os.path.normpath(os.path.abspath(file_path)).lower() if file_path else ""
-            is_in_system32 = "windows\\system32" in norm_p or "windows\\syswow64" in norm_p
+            sys_root = os.environ.get("SystemRoot", "C:\\Windows").lower()
+            real_sys32 = os.path.normpath(os.path.join(sys_root, "system32")).lower()
+            real_syswow64 = os.path.normpath(os.path.join(sys_root, "syswow64")).lower()
+            is_in_system32 = (
+                norm_p.startswith(real_sys32 + os.sep)
+                or norm_p == real_sys32
+                or norm_p.startswith(real_syswow64 + os.sep)
+                or norm_p == real_syswow64
+            )
             if not is_in_system32:
                 matched_dll = base_name if base_name in KNOWN_HIJACKABLE_SYSTEM_DLLS else internal_lower
                 anomalies.append(
