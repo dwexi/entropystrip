@@ -53,24 +53,31 @@ def compute_piecewise_hash(data: bytes, block_size: int) -> Tuple[str, str]:
     fnv1 = 0x811C9DC5
     fnv2 = 0x811C9DC5
 
+    h1_has_residual = False
+    h2_has_residual = False
+
     for b in data:
         fnv1 = ((fnv1 ^ b) * 0x01000193) & 0xFFFFFFFF
         fnv2 = ((fnv2 ^ b) * 0x01000193) & 0xFFFFFFFF
         h_val = rh.update(b)
+        h1_has_residual = True
+        h2_has_residual = True
 
         if h_val % bs1 == (bs1 - 1):
             if len(h1_chars) < 64:
                 h1_chars.append(B64_CHARS[fnv1 % 64])
                 fnv1 = 0x811C9DC5
+                h1_has_residual = False
 
         if h_val % bs2 == (bs2 - 1):
-            if len(h2_chars) < 32:
+            if len(h2_chars) < 64:
                 h2_chars.append(B64_CHARS[fnv2 % 64])
                 fnv2 = 0x811C9DC5
+                h2_has_residual = False
 
-    if len(h1_chars) < 64:
+    if h1_has_residual and len(h1_chars) < 64:
         h1_chars.append(B64_CHARS[fnv1 % 64])
-    if len(h2_chars) < 32:
+    if h2_has_residual and len(h2_chars) < 64:
         h2_chars.append(B64_CHARS[fnv2 % 64])
 
     return "".join(h1_chars), "".join(h2_chars)
@@ -195,49 +202,61 @@ def cluster_samples(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Groups samples into campaign similarity clusters based on fuzzy hashing (SSDEEP).
+    Uses complete-linkage (clique) clustering so all samples in a cluster share
+    pairwise similarity >= similarity_threshold, preventing transitive chaining collapse.
     
     Returns:
-        Mapping of cluster_name (e.g. 'Cluster-1') -> list of matching samples.
+        Mapping of cluster_name (e.g. 'Campaign-Cluster-1') -> list of matching samples.
     """
     valid_samples = [s for s in samples if s.get("fuzzy_hash")]
     n = len(valid_samples)
     if n <= 1:
         return {}
 
-    # Build adjacency matrix
-    adj: Dict[int, List[int]] = {i: [] for i in range(n)}
+    # Build pairwise similarity matrix
+    sim_matrix = [[0] * n for _ in range(n)]
     for i in range(n):
+        sim_matrix[i][i] = 100
         for j in range(i + 1, n):
             h1 = valid_samples[i]["fuzzy_hash"]
             h2 = valid_samples[j]["fuzzy_hash"]
             sim = compare_fuzzy_hashes(h1, h2)
-            if sim >= similarity_threshold:
-                adj[i].append(j)
-                adj[j].append(i)
+            sim_matrix[i][j] = sim
+            sim_matrix[j][i] = sim
 
-    # Connected components
-    visited = set()
+    # Complete-linkage clustering
     clusters: Dict[str, List[Dict[str, Any]]] = {}
     cluster_idx = 1
+    unassigned = set(range(n))
 
-    for i in range(n):
-        if i not in visited:
-            component = []
-            queue = [i]
-            visited.add(i)
-            while queue:
-                curr = queue.pop(0)
-                component.append(valid_samples[curr])
-                for neighbor in adj[curr]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
+    # Order nodes by candidate neighbors meeting threshold
+    degrees = [
+        sum(1 for j in range(n) if i != j and sim_matrix[i][j] >= similarity_threshold)
+        for i in range(n)
+    ]
+    sorted_nodes = sorted(range(n), key=lambda x: degrees[x], reverse=True)
 
-            if len(component) >= 2:
-                c_name = f"Campaign-Cluster-{cluster_idx}"
-                clusters[c_name] = component
-                for s in component:
-                    s["cluster_id"] = c_name
-                cluster_idx += 1
+    for i in sorted_nodes:
+        if i not in unassigned:
+            continue
+
+        candidates = [j for j in unassigned if j != i and sim_matrix[i][j] >= similarity_threshold]
+        if not candidates:
+            continue
+
+        clique = [i]
+        for cand in candidates:
+            if all(sim_matrix[cand][member] >= similarity_threshold for member in clique):
+                clique.append(cand)
+
+        if len(clique) >= 2:
+            c_name = f"Campaign-Cluster-{cluster_idx}"
+            cluster_members = [valid_samples[idx] for idx in clique]
+            clusters[c_name] = cluster_members
+            for s in cluster_members:
+                s["cluster_id"] = c_name
+            cluster_idx += 1
+            for idx in clique:
+                unassigned.remove(idx)
 
     return clusters

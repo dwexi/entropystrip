@@ -27,8 +27,8 @@ def calculate_dilution_metrics(data: bytes) -> Tuple[float, float, bool, str]:
     for b in buf:
         counts[b] += 1
 
-    # Identify all modal outlier candidates where frequency >= 12%
-    modal_candidates = [b for b in range(256) if (counts[b] / n) >= 0.12]
+    # Identify all modal outlier candidates where frequency >= 10%
+    modal_candidates = [b for b in range(256) if (counts[b] / n) >= 0.10]
     modal_candidates.sort(key=lambda b: counts[b], reverse=True)
 
     if not modal_candidates:
@@ -47,9 +47,9 @@ def calculate_dilution_metrics(data: bytes) -> Tuple[float, float, bool, str]:
                 pad_name = "null-byte" if top_mode == 0 else f"repeated-byte (0x{top_mode:02X})"
                 return ent_single, top_ratio, True, pad_name
 
-    # 2. Multimodal padding check (2 to 4 alternating padding bytes dominating >= 30%)
+    # 2. Multimodal padding check (composite alternating padding bytes dominating >= 30%)
     if len(modal_candidates) >= 2:
-        modal_set = set(modal_candidates[:4])
+        modal_set = set(modal_candidates)
         total_modal_count = sum(counts[b] for b in modal_set)
         total_pad_ratio = total_modal_count / n
 
@@ -58,7 +58,9 @@ def calculate_dilution_metrics(data: bytes) -> Tuple[float, float, bool, str]:
             if len(non_pad_multi) >= 256:
                 ent_multi = calculate_entropy(non_pad_multi)
                 if ent_multi > 7.30:
-                    hex_modes = ", ".join([f"0x{b:02X}" for b in modal_candidates[:4]])
+                    hex_modes = ", ".join([f"0x{b:02X}" for b in modal_candidates[:8]])
+                    if len(modal_candidates) > 8:
+                        hex_modes += f" (+{len(modal_candidates) - 8} more)"
                     pad_name = f"multimodal repeated-byte ({hex_modes})"
                     return ent_multi, total_pad_ratio, True, pad_name
 
@@ -85,15 +87,15 @@ def calculate_chi_square(data: bytes) -> Tuple[float, float, bool]:
     expected = n / 256.0
     chi2 = sum(((c - expected) ** 2) / expected for c in counts)
 
-    # Detect dominant mode(s) with frequency >= 12%
-    modal_candidates = [b for b in range(256) if (counts[b] / n) >= 0.12]
+    # Detect dominant mode(s) with frequency >= 10%
+    modal_candidates = [b for b in range(256) if (counts[b] / n) >= 0.10]
     modal_candidates.sort(key=lambda b: counts[b], reverse=True)
     if not modal_candidates:
         return chi2, 0.0, False
 
-    # Take top mode, or top composite modes if multimodal
-    if len(modal_candidates) >= 2 and (sum(counts[b] for b in modal_candidates[:4]) / n) >= 0.25:
-        mode_set = set(modal_candidates[:4])
+    # Take top mode, or composite modes if multimodal
+    if len(modal_candidates) >= 2 and (sum(counts[b] for b in modal_candidates) / n) >= 0.25:
+        mode_set = set(modal_candidates)
     else:
         mode_set = {modal_candidates[0]}
 
@@ -106,7 +108,7 @@ def calculate_chi_square(data: bytes) -> Tuple[float, float, bool]:
     k = len(mode_set)
     dof = 256 - k - 1
     # Check minimum sample size to avoid Cochran's rule violation (expected count >= 5 per bin)
-    min_sample = (256 - k) * 5 # ~1270 bytes
+    min_sample = (256 - k) * 5  # ~1270 bytes
     if pad_ratio >= 0.15 and nz_total >= min_sample:
         nz_expected = nz_total / float(256 - k)
         nz_chi2 = sum(((c - nz_expected) ** 2) / nz_expected for c in non_mode_counts)
@@ -117,11 +119,21 @@ def calculate_chi_square(data: bytes) -> Tuple[float, float, bool]:
         upper_bound = mu + 4.0 * sigma
         if lower_bound <= nz_chi2 <= upper_bound:
             is_diluted_uniform = True
-    elif pad_ratio >= 0.15 and nz_total >= 512 and k == 1:
-        # Fallback for moderate single-mode buffers
-        nz_expected = nz_total / 255.0
+    elif pad_ratio >= 0.15 and nz_total >= 512:
+        # Fallback for moderate buffers (k >= 1) using Cochran's rule compliant 16-bin coarse aggregation
+        # Aggregate non-mode bytes into 16 coarse bins (E_i = nz_total / 16 >= 32 >= 5)
+        coarse_counts = [0] * 16
+        for b in buf:
+            if b not in mode_set:
+                coarse_counts[b % 16] += 1
+        coarse_expected = nz_total / 16.0
+        coarse_chi2 = sum(((c - coarse_expected) ** 2) / coarse_expected for c in coarse_counts)
+
+        nz_expected = nz_total / float(256 - k)
         nz_chi2 = sum(((c - nz_expected) ** 2) / nz_expected for c in non_mode_counts)
-        if 160.0 <= nz_chi2 <= 420.0:
+        mu = float(dof)
+        sigma = math.sqrt(2.0 * dof)
+        if coarse_chi2 <= 35.0 or (max(50.0, mu - 4.0 * sigma) <= nz_chi2 <= mu + 4.0 * sigma):
             is_diluted_uniform = True
 
     return chi2, nz_chi2, is_diluted_uniform

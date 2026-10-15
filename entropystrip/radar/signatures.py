@@ -2,6 +2,7 @@
 Installer frameworks (NSIS, Inno Setup, Burn) and Authenticode WIN_CERTIFICATE verification.
 """
 
+import os
 from typing import Optional, Tuple
 import pefile
 
@@ -53,11 +54,15 @@ def detect_installer(
 
 
 def check_authenticode_signature(
-    pe: pefile.PE, file_size: int = 0, file_data: bytes = b""
+    pe: pefile.PE,
+    file_size: int = 0,
+    file_data: bytes = b"",
+    file_path: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Validates the PE Security Directory structure (WIN_CERTIFICATE table).
     Ensures directory offsets reside within the physical file bounds and header fields are valid.
+    Supports seek-and-read from disk/pe.__data__ when file_data is truncated in large file mode.
     """
     try:
         if not hasattr(pe, "OPTIONAL_HEADER") or not hasattr(pe.OPTIONAL_HEADER, "DATA_DIRECTORY"):
@@ -69,23 +74,37 @@ def check_authenticode_signature(
         if sec_dir.VirtualAddress == 0 or sec_dir.Size == 0:
             return False, "Unsigned"
 
+        if file_size <= 0:
+            return False, "Invalid or empty file size"
+
         offset = sec_dir.VirtualAddress
         size = sec_dir.Size
 
-        if file_size > 0 and file_data:
-            if offset + size > file_size or offset < 0x200 or size < 8:
-                return False, "Security directory offset/size points out of bounds"
+        if offset + size > file_size or offset < 0x200 or size < 8:
+            return False, "Security directory offset/size points out of bounds"
 
+        cert_header = b""
+        if file_data and len(file_data) >= offset + 8:
             cert_header = file_data[offset : offset + 8]
-            if len(cert_header) < 8:
-                return False, "Truncated certificate header"
+        elif hasattr(pe, "__data__") and len(pe.__data__) >= offset + 8:
+            cert_header = pe.__data__[offset : offset + 8]
+        elif file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, "rb") as f:
+                    f.seek(offset)
+                    cert_header = f.read(8)
+            except Exception:
+                cert_header = b""
 
-            dw_length = int.from_bytes(cert_header[0:4], "little")
-            w_revision = int.from_bytes(cert_header[4:6], "little")
-            w_cert_type = int.from_bytes(cert_header[6:8], "little")
+        if len(cert_header) < 8:
+            return False, "Truncated certificate header"
 
-            if dw_length > size or w_revision not in (0x0100, 0x0200) or w_cert_type != 0x0002:
-                return False, "Malformed or forged WIN_CERTIFICATE header"
+        dw_length = int.from_bytes(cert_header[0:4], "little")
+        w_revision = int.from_bytes(cert_header[4:6], "little")
+        w_cert_type = int.from_bytes(cert_header[6:8], "little")
+
+        if dw_length > size or w_revision not in (0x0100, 0x0200) or w_cert_type != 0x0002:
+            return False, "Malformed or forged WIN_CERTIFICATE header"
 
         return True, "Valid Authenticode PKCS#7 signed structure"
     except Exception as e:

@@ -161,7 +161,7 @@ def analyze_single_file(
             pe.parse_data_directories()
         else:
             pe = pefile.PE(data=file_data)
-    except Exception:
+    except Exception as pe_err:
         if pe is not None and hasattr(pe, "close"):
             try:
                 pe.close()
@@ -169,22 +169,45 @@ def analyze_single_file(
                 pass
         # Check if the file starts with MZ but has corrupted or fuzzed headers
         if file_data[:2] == b"MZ":
-            e_lfanew = 0
-            if len(file_data) >= 64:
-                e_lfanew = struct.unpack("<I", file_data[60:64])[0]
-
-            if e_lfanew < 64:
-                anomalies = ["Legacy 16-bit MS-DOS binary (e_lfanew < 64, no valid PE32 header)."]
-                threat_score = 25
-                verdict_text = "[INFO] Legacy MS-DOS Binary"
-                verdict_color = "dim"
-            else:
+            if len(file_data) < 64:
+                # D1-01: Truncated DOS header (< 64 bytes is insufficient for IMAGE_DOS_HEADER)
                 anomalies = [
-                    f"Header Anomaly: Corrupted DOS e_lfanew pointer ({hex(e_lfanew)}) points past EOF or into malformed headers."
+                    f"Header Anomaly: Truncated DOS header ({len(file_data)} bytes < 64 bytes required for IMAGE_DOS_HEADER)."
                 ]
-                threat_score = 70
+                threat_score = 65
                 verdict_text = "[CRITICAL] High Risk (Corrupted / Malformed PE Headers)"
                 verdict_color = "bold red"
+            else:
+                e_lfanew = struct.unpack("<I", file_data[60:64])[0]
+                if e_lfanew < 64:
+                    anomalies = ["Legacy 16-bit MS-DOS binary (e_lfanew < 64, no valid PE32 header)."]
+                    threat_score = 25
+                    verdict_text = "[INFO] Legacy MS-DOS Binary"
+                    verdict_color = "dim"
+                elif e_lfanew + 4 > file_size:
+                    # D1-02: Accurately distinguish e_lfanew pointing past EOF
+                    anomalies = [
+                        f"Header Anomaly: DOS e_lfanew pointer ({hex(e_lfanew)}) points past EOF (file size {file_size} bytes)."
+                    ]
+                    threat_score = 70
+                    verdict_text = "[CRITICAL] High Risk (Corrupted / Malformed PE Headers)"
+                    verdict_color = "bold red"
+                elif e_lfanew + 4 <= len(file_data) and file_data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+                    # D1-02: Accurately distinguish invalid PE signature from e_lfanew EOF
+                    bad_sig = repr(bytes(file_data[e_lfanew : e_lfanew + 4]))
+                    anomalies = [
+                        f"Header Anomaly: Invalid PE signature at e_lfanew ({hex(e_lfanew)}): found {bad_sig}, expected b'PE\\x00\\x00'."
+                    ]
+                    threat_score = 70
+                    verdict_text = "[CRITICAL] High Risk (Corrupted / Malformed PE Headers)"
+                    verdict_color = "bold red"
+                else:
+                    anomalies = [
+                        f"Header Anomaly: Malformed PE header structure ({pe_err})."
+                    ]
+                    threat_score = 70
+                    verdict_text = "[CRITICAL] High Risk (Corrupted / Malformed PE Headers)"
+                    verdict_color = "bold red"
 
             f_hashes = compute_hashes(file_data) if not is_large_file else compute_file_hashes(norm_path)
             f_fuzzy = compute_fuzzy_hash(file_data) if file_data else None
@@ -459,7 +482,7 @@ def analyze_single_file(
         )
 
     is_dotnet = is_dotnet_assembly(pe)
-    is_signed, cert_msg = check_authenticode_signature(pe, file_size, file_data)
+    is_signed, cert_msg = check_authenticode_signature(pe, file_size, file_data, file_path=norm_path)
     if "Malformed or forged" in cert_msg or "out of bounds" in cert_msg:
         anomalies.append(f"Security Directory Anomaly: {cert_msg}.")
         threat_score += 30

@@ -56,8 +56,20 @@ def scan_sliding_window_entropy(
     Scanning in 1024-byte and 256-byte windows with adaptive stepping catches compact
     stagers regardless of total section size.
     """
-    if not data or len(data) < 256:
+    if not data:
         return 0.0, []
+
+    if len(data) < 256:
+        sub_ent = calculate_entropy(data)
+        spans = []
+        if sub_ent >= threshold:
+            spans.append({
+                "start": 0,
+                "end": len(data),
+                "max_ent": sub_ent,
+                "scale": len(data),
+            })
+        return sub_ent, spans
 
     # Scale step size on large buffers to maintain sub-second triage speeds
     if step_size is None:
@@ -71,7 +83,12 @@ def scan_sliding_window_entropy(
     anomalous_spans = []
     current_span = None
 
-    for offset in range(0, len(data) - effective_window + 1, step_size):
+    offsets = list(range(0, len(data) - effective_window + 1, step_size))
+    tail_offset = len(data) - effective_window
+    if tail_offset > 0 and (not offsets or offsets[-1] != tail_offset):
+        offsets.append(tail_offset)
+
+    for offset in offsets:
         chunk = data[offset : offset + effective_window]
         ent = calculate_entropy(chunk)
         if ent > max_ent:
@@ -86,7 +103,7 @@ def scan_sliding_window_entropy(
                     "scale": effective_window,
                 }
             else:
-                current_span["end"] = offset + effective_window
+                current_span["end"] = max(current_span["end"], offset + effective_window)
                 if ent > current_span["max_ent"]:
                     current_span["max_ent"] = ent
         else:
@@ -102,7 +119,12 @@ def scan_sliding_window_entropy(
         sub_win = 256
         sub_step = 64 if len(data) <= 500_000 else 256
         scan_limit = min(len(data), 2_000_000)
-        for offset in range(0, scan_limit - sub_win + 1, sub_step):
+        sub_offsets = list(range(0, scan_limit - sub_win + 1, sub_step))
+        sub_tail = scan_limit - sub_win
+        if sub_tail > 0 and (not sub_offsets or sub_offsets[-1] != sub_tail):
+            sub_offsets.append(sub_tail)
+
+        for offset in sub_offsets:
             chunk = data[offset : offset + sub_win]
             sub_ent = calculate_entropy(chunk)
             if sub_ent > max_ent:
