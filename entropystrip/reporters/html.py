@@ -109,7 +109,11 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
     bazaar = telemetry.get("bazaar_intel")
     if bazaar and bazaar.get("status") == "malicious":
         vt = bazaar.get("virustotal") or {}
-        vt_str = f"{vt.get('percent', 0.0):.1f}% ({vt.get('positives', 0)}/{vt.get('total', 0)})" if vt else "N/A"
+        raw_pct = vt.get("percent")
+        pct_val = float(raw_pct) if raw_pct is not None else 0.0
+        pos_val = vt.get("positives") or 0
+        tot_val = vt.get("total") or 0
+        vt_str = f"{pct_val:.1f}% ({pos_val}/{tot_val})" if vt else "N/A"
         bazaar_html = f"""
         <div class="findings-card" style="border-left: 3px solid #e06c75; margin-bottom: 20px;">
             <h3 style="color:#e06c75;">MalwareBazaar Threat Intelligence (abuse.ch)</h3>
@@ -200,7 +204,7 @@ def generate_html_report(telemetry: Union[Dict[str, Any], List[Dict[str, Any]]],
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; object-src 'none';">
 <title>EntropyStrip - {html.escape(str(telemetry.get('filename', 'Unknown')))}</title>
 <style>
     body {{
@@ -553,7 +557,11 @@ def generate_directory_html_report(
         bazaar = r.get("bazaar_intel")
         if bazaar and bazaar.get("status") == "malicious":
             vt = bazaar.get("virustotal") or {}
-            vt_str = f"{vt.get('percent', 0.0):.1f}% ({vt.get('positives', 0)}/{vt.get('total', 0)})" if vt else "N/A"
+            raw_pct = vt.get("percent")
+            pct_val = float(raw_pct) if raw_pct is not None else 0.0
+            pos_val = vt.get("positives") or 0
+            tot_val = vt.get("total") or 0
+            vt_str = f"{pct_val:.1f}% ({pos_val}/{tot_val})" if vt else "N/A"
             bazaar_section = f"""
             <div style="background:#1f242c; border-left:3px solid #e06c75; padding:8px 12px; margin:8px 0; border-radius:3px;">
                 <b style="color:#e06c75;">MalwareBazaar Threat Intel (abuse.ch):</b> {html.escape(str(bazaar.get('signature', 'Unknown Threat')))}
@@ -590,7 +598,13 @@ def generate_directory_html_report(
                 f"<td style='font-family:monospace; color:#e5c07b;'>{html.escape(str(f.get('forward_target', '')))}</td></tr>"
                 for f in forwarded
             ])
-            masq_note = f"<div style='color:#e06c75; font-size:11px; margin-bottom:4px;'>Masquerading Anomaly: Exports match system DLL ({exp_info.get('masqueraded_dll', '')}) - Proxying Risk</div>" if exp_info.get("is_masquerading") else ""
+            masq_dll = html.escape(str(exp_info.get("masqueraded_dll", "")))
+            masq_note = (
+                f"<div style='color:#e06c75; font-size:11px; margin-bottom:4px;'>"
+                f"Masquerading Anomaly: Exports match system DLL ({masq_dll}) - Proxying Risk</div>"
+                if exp_info.get("is_masquerading")
+                else ""
+            )
             export_section = f"""
             <h4 style="margin:12px 0 4px 0; font-size:11px; color:#e5c07b; text-transform:uppercase;">Export Forwarding &amp; Proxying (EAT)</h4>
             {masq_note}
@@ -665,7 +679,7 @@ def generate_directory_html_report(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; object-src 'none';">
 <title>EntropyStrip - Incident Triage Leaderboard</title>
 <style>
     body {{

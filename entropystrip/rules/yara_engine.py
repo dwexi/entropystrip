@@ -4,7 +4,7 @@ Supports bundled threat rules and custom user-provided .yar files/directories.
 """
 
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 try:
     import yara
@@ -86,6 +86,34 @@ def compile_yara_rules(custom_path: Optional[str] = None) -> Optional[Any]:
         return None
 
 
+def _eval_cobalt_strike(matched_set: Set[str]) -> Tuple[bool, List[str]]:
+    pipes = {"\\\\.\\pipe\\msagent_", "\\\\.\\pipe\\status_", "\\\\.\\pipe\\postex_"}
+    uas = {"mozilla/5.0 (compatible; msie 9.0; windows nt 6.1;", "%s.4444.%s"}
+    cmd = "%c2_server%"
+    pipe_count = sum(1 for p in pipes if p in matched_set)
+    matched = [s for s in matched_set if s in pipes or s in uas or s == cmd]
+    passed = (pipe_count >= 2) or any(u in matched_set for u in uas) or (cmd in matched_set)
+    return passed, matched
+
+
+def _eval_ransomware(matched_set: Set[str]) -> Tuple[bool, List[str]]:
+    vss = ("vssadmin" in matched_set) and ("delete shadows" in matched_set)
+    wmic = ("wmic" in matched_set) and ("shadowcopy delete" in matched_set)
+    bcd = ("bcdedit" in matched_set) and (
+        ("bootstatuspolicy ignoreallfailures" in matched_set) or ("recoveryenabled no" in matched_set)
+    )
+    wb = "wbadmin delete catalog" in matched_set
+    matched = [
+        s for s in [
+            "vssadmin", "delete shadows", "wmic", "shadowcopy delete",
+            "bcdedit", "bootstatuspolicy ignoreallfailures", "recoveryenabled no",
+            "wbadmin delete catalog"
+        ] if s in matched_set
+    ]
+    passed = vss or wmic or bcd or wb
+    return passed, matched
+
+
 FALLBACK_RULES = [
     {
         "rule": "CobaltStrike_Beacon_Indicators",
@@ -94,12 +122,14 @@ FALLBACK_RULES = [
         "threat_score": 50,
         "mitre": "T1071.001",
         "patterns": [
-            b"\\\\.\\pipe\\msagent_",
-            b"\\\\.\\pipe\\status_",
-            b"\\\\.\\pipe\\postex_",
-            b"Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1;",
-            b"%C2_SERVER%",
+            (b"\\\\.\\pipe\\msagent_", True, True),
+            (b"\\\\.\\pipe\\status_", True, True),
+            (b"\\\\.\\pipe\\postex_", True, True),
+            (b"Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1;", False, False),
+            (b"%s.4444.%s", False, False),
+            (b"%C2_SERVER%", False, False),
         ],
+        "evaluator": _eval_cobalt_strike,
     },
     {
         "rule": "Ransomware_ShadowCopy_Tampering",
@@ -108,12 +138,16 @@ FALLBACK_RULES = [
         "threat_score": 45,
         "mitre": "T1490",
         "patterns": [
-            b"delete shadows",
-            b"shadowcopy delete",
-            b"bootstatuspolicy ignoreallfailures",
-            b"recoveryenabled no",
-            b"wbadmin delete catalog",
+            (b"vssadmin", True, True),
+            (b"delete shadows", True, True),
+            (b"wmic", True, True),
+            (b"shadowcopy delete", True, True),
+            (b"bcdedit", True, True),
+            (b"bootstatuspolicy ignoreallfailures", True, True),
+            (b"recoveryenabled no", True, True),
+            (b"wbadmin delete catalog", True, True),
         ],
+        "evaluator": _eval_ransomware,
     },
     {
         "rule": "Suspicious_Process_Spawning_Primitives",
@@ -122,13 +156,15 @@ FALLBACK_RULES = [
         "threat_score": 35,
         "mitre": "T1059.001",
         "patterns": [
-            b"powershell -enc",
-            b"powershell -encodedcommand",
-            b"certutil -urlcache -split -f",
-            b"bitsadmin /transfer",
-            b"mshta vbscript:Execute",
-            b"mshta javascript:",
+            (b"powershell -enc", True, True),
+            (b"powershell -encodedcommand", True, True),
+            (b"powershell.exe -w hidden -enc", True, True),
+            (b"certutil -urlcache -split -f", True, True),
+            (b"bitsadmin /transfer", True, True),
+            (b"mshta vbscript:Execute", True, True),
+            (b"mshta javascript:", True, True),
         ],
+        "evaluator": None,
     },
     {
         "rule": "Reflective_DLL_Injection_Signature",
@@ -137,10 +173,11 @@ FALLBACK_RULES = [
         "threat_score": 40,
         "mitre": "T1055.001",
         "patterns": [
-            b"ReflectiveLoader",
-            b"?ReflectiveLoader@@",
-            b"reflective_dll",
+            (b"ReflectiveLoader", False, False),
+            (b"?ReflectiveLoader@@", False, False),
+            (b"reflective_dll", True, True),
         ],
+        "evaluator": None,
     },
     {
         "rule": "Shellcode_EggHunter_Signature",
@@ -149,10 +186,11 @@ FALLBACK_RULES = [
         "threat_score": 45,
         "mitre": "T1055",
         "patterns": [
-            b"\x66\x81\xca\xff\x0f\x42\x52\x6a\x02\x58\xcd\x2e",
-            b"w00tw00t",
-            b"c0d3c0d3",
+            (b"\x66\x81\xca\xff\x0f\x42\x52\x6a\x02\x58\xcd\x2e", False, False),
+            (b"w00tw00t", False, False),
+            (b"c0d3c0d3", False, False),
         ],
+        "evaluator": None,
     },
 ]
 
@@ -161,16 +199,47 @@ def scan_fallback_rules(data: bytes) -> List[Dict[str, Any]]:
     """Pure-Python signature scanner executing when native yara-python is not installed."""
     if not data:
         return []
-    
-    matches = []
+
     lower_data = data.lower()
+    matches = []
+
     for rule in FALLBACK_RULES:
-        matched_patterns = []
-        for pat in rule["patterns"]:
-            if pat.lower() in lower_data:
-                matched_patterns.append(pat.decode("latin-1", errors="replace"))
-        
-        if matched_patterns:
+        matched_str_set: Set[str] = set()
+        matched_display: List[str] = []
+
+        for pat, wide, nocase in rule["patterns"]:
+            candidates = [pat]
+            if wide:
+                try:
+                    candidates.append(pat.decode("latin-1").encode("utf-16le"))
+                except Exception:
+                    pass
+
+            pat_matched = False
+            for cand in candidates:
+                if nocase:
+                    if cand.lower() in lower_data:
+                        pat_matched = True
+                        break
+                else:
+                    if cand in data:
+                        pat_matched = True
+                        break
+
+            if pat_matched:
+                decoded = pat.decode("latin-1", errors="replace").lower()
+                matched_str_set.add(decoded)
+                display_str = pat.decode("latin-1", errors="replace")
+                if display_str not in matched_display:
+                    matched_display.append(display_str)
+
+        evaluator = rule.get("evaluator")
+        if evaluator is not None:
+            passed, eval_matched = evaluator(matched_str_set)
+        else:
+            passed = len(matched_str_set) > 0
+
+        if passed:
             matches.append(
                 {
                     "rule": rule["rule"],
@@ -180,7 +249,7 @@ def scan_fallback_rules(data: bytes) -> List[Dict[str, Any]]:
                     "severity": rule["severity"],
                     "mitre": rule["mitre"],
                     "threat_score": rule["threat_score"],
-                    "matched_strings": matched_patterns,
+                    "matched_strings": matched_display,
                 }
             )
     return matches
@@ -215,9 +284,9 @@ def scan_yara(
     matches = []
     try:
         if file_path and os.path.isfile(file_path):
-            raw_matches = rules.match(filepath=file_path)
+            raw_matches = rules.match(filepath=file_path, timeout=30)
         else:
-            raw_matches = rules.match(data=data)
+            raw_matches = rules.match(data=data, timeout=30)
         for m in raw_matches:
             meta = getattr(m, "meta", {}) or {}
             score = int(meta.get("score", 35))

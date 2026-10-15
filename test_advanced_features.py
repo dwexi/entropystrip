@@ -110,7 +110,7 @@ class TestYaraEngine(unittest.TestCase):
     """Verifies YARA rule compilation, default rules, and pure-Python fallback execution."""
 
     def test_fallback_engine_cobalt_strike(self):
-        payload = b"\x90\x90\x90\\\\.\\pipe\\msagent_5f3a\x00\x00\x90\x90"
+        payload = b"\x90\x90\x90\\\\.\\pipe\\msagent_5f3a\x00\x00\\\\.\\pipe\\status_98ab\x90\x90"
         matches = scan_fallback_rules(payload)
         self.assertTrue(any(m["rule"] == "CobaltStrike_Beacon_Indicators" for m in matches))
         match = next(m for m in matches if m["rule"] == "CobaltStrike_Beacon_Indicators")

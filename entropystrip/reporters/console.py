@@ -36,11 +36,11 @@ def render_console_report(
     """Renders comprehensive CLI triage dashboard."""
     console.print(f"\n[bold]Target:[/bold] {escape(target_path)}")
     if deep and hashes:
-        console.print(f"[dim]SHA256: {hashes.get('sha256', '-')}[/dim]")
+        console.print(f"[dim]SHA256: {escape(str(hashes.get('sha256', '-')))}[/dim]")
         if imphash_val:
-            console.print(f"[dim]Imphash: {imphash_val}[/dim]")
+            console.print(f"[dim]Imphash: {escape(str(imphash_val))}[/dim]")
         if fuzzy_hash:
-            console.print(f"[dim]SSDEEP:  {fuzzy_hash}[/dim]")
+            console.print(f"[dim]SSDEEP:  {escape(str(fuzzy_hash))}[/dim]")
 
     console.print(sections_table)
 
@@ -212,7 +212,7 @@ def render_triage_leaderboard(
         console.print("\n[bold cyan]Automated Campaign Clusters (Fuzzy Hash Similarity >= 70%):[/bold cyan]")
         for c_name, members in clusters.items():
             names = ", ".join([escape(m["filename"]) for m in members])
-            console.print(f"  • [bold magenta]{c_name}[/bold magenta] ({len(members)} binaries): [dim]{names}[/dim]")
+            console.print(f"  • [bold magenta]{escape(str(c_name))}[/bold magenta] ({len(members)} binaries): [dim]{names}[/dim]")
 
     console.print(f"\n[green][+] Completed:[/green] Triaged {len(results)} binaries.")
 

@@ -213,8 +213,26 @@ def detect_overlay(
     max_overlay_bytes: int = 10 * 1024 * 1024,
 ) -> Tuple[int, bytes]:
     max_offset = 0
+    file_alignment = getattr(getattr(pe, "OPTIONAL_HEADER", None), "FileAlignment", 512)
     for section in pe.sections:
-        end = min(section.PointerToRawData + section.SizeOfRawData, file_size)
+        ptr = getattr(section, "PointerToRawData", 0)
+        raw_sz = getattr(section, "SizeOfRawData", 0)
+        v_sz = getattr(section, "Misc_VirtualSize", 0)
+
+        if ptr + raw_sz <= file_size:
+            end = ptr + raw_sz
+        else:
+            # SizeOfRawData extends beyond physical file size (inflated header anomaly)
+            aligned_vsize = (
+                ((v_sz + file_alignment - 1) // file_alignment) * file_alignment
+                if (file_alignment and v_sz)
+                else 0
+            )
+            if aligned_vsize > 0 and ptr + aligned_vsize <= file_size:
+                end = ptr + aligned_vsize
+            else:
+                end = ptr
+
         if end > max_offset:
             max_offset = end
 

@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import struct
+import hashlib
 from typing import Optional, Dict, Any, List, Tuple
 import pefile
 from rich.table import Table
@@ -161,6 +162,11 @@ def analyze_single_file(
         else:
             pe = pefile.PE(data=file_data)
     except Exception:
+        if pe is not None and hasattr(pe, "close"):
+            try:
+                pe.close()
+            except Exception:
+                pass
         # Check if the file starts with MZ but has corrupted or fuzzed headers
         if file_data[:2] == b"MZ":
             e_lfanew = 0
@@ -237,10 +243,49 @@ def analyze_single_file(
         anomalies.extend(overlap_anomalies)
         threat_score += overlap_penalty
 
+    # Check section table bounds and dropped sections (D1-04, D1-05)
+    expected_sections = getattr(pe.FILE_HEADER, "NumberOfSections", 0) if hasattr(pe, "FILE_HEADER") else 0
+    if expected_sections == 0:
+        anomalies.append("Header Anomaly: NumberOfSections is 0 (headless PE / driver anomaly).")
+        threat_score += 35
+    elif expected_sections > 96:
+        anomalies.append(f"Header Anomaly: NumberOfSections ({expected_sections}) exceeds Windows loader maximum (96).")
+        threat_score += 40
+    elif len(pe.sections) < expected_sections:
+        missing = expected_sections - len(pe.sections)
+        anomalies.append(
+            f"Corrupted Section Table: {missing} section(s) dropped due to invalid pointers (claimed {expected_sections}, parsed {len(pe.sections)})."
+        )
+        threat_score += 45
+
+    if hasattr(pe, "get_warnings"):
+        for w in pe.get_warnings():
+            anomalies.append(f"Parser Warning: {w}")
+            threat_score += 15
+
+    MAX_SECTION_IN_MEM = 2 * 1024 * 1024
     for section in pe.sections:
         name = sanitize_section_name(section.Name).lower()
 
-        raw_data = section.get_data()
+        raw_sz = getattr(section, "SizeOfRawData", 0)
+        raw_ptr = getattr(section, "PointerToRawData", 0)
+        if raw_sz > MAX_SECTION_IN_MEM:
+            half = MAX_SECTION_IN_MEM // 2
+            try:
+                head = pe.get_data(raw_ptr, half)
+                tail = pe.get_data(raw_ptr + max(0, raw_sz - half), half)
+                raw_data = head + tail
+            except Exception:
+                try:
+                    raw_data = section.get_data()[:MAX_SECTION_IN_MEM]
+                except Exception:
+                    raw_data = b""
+        else:
+            try:
+                raw_data = section.get_data()
+            except Exception:
+                raw_data = b""
+
         entropy = calculate_entropy(raw_data)
 
         # Check for null-byte or repeated-byte padding dilution
@@ -759,19 +804,23 @@ def analyze_single_file(
         )
 
     if dump_payloads and high_entropy_sections:
-        out_dir = "extracted_payloads"
+        out_dir = os.path.abspath("extracted_payloads")
         os.makedirs(out_dir, exist_ok=True)
-        sha_pfx = hashes.get("sha256", "00000000")[:8]
-        clean_base = "".join([c if c.isalnum() or c == "." else "_" for c in os.path.basename(file_path)])
         for idx, (s_name, data, ent) in enumerate(high_entropy_sections):
+            payload_sha256 = hashlib.sha256(data).hexdigest()
             clean_name = "".join([c if c.isalnum() else "_" for c in s_name])
-            out_path = os.path.join(out_dir, f"{sha_pfx}_{clean_base}_sec{idx}_{clean_name}.bin")
-            with open(out_path, "wb") as f:
-                f.write(data)
+            artifact_filename = f"payload_{payload_sha256}_sec{idx}_{clean_name}.bin"
+            out_path = os.path.abspath(os.path.join(out_dir, artifact_filename))
+            # Prevent directory traversal attacks (D5-05)
+            if os.path.commonpath([out_dir, out_path]) != out_dir:
+                continue
+            if not os.path.exists(out_path):
+                with open(out_path, "wb") as f:
+                    f.write(data)
             if not quiet:
                 console.print(f"[green][+] Carved payload ({len(data)} bytes) -> {out_path}[/green]")
 
-    if is_large_file and pe and hasattr(pe, "close"):
+    if pe is not None and hasattr(pe, "close"):
         try:
             pe.close()
         except Exception:
